@@ -1,0 +1,11 @@
+target/
+**/*.rs.bk
+Cargo.lock
+.env
+*.log
+research/benchmarks/*
+research/openshell/*
+research/defenseclaw/*
+!research/benchmarks/.gitkeep
+!research/openshell/.gitkeep
+!research/defenseclaw/.gitkeep
