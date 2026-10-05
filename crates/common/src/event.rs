@@ -13,6 +13,8 @@ pub enum EnforcementAction {
     DropConnection,
     TerminateProcess,
     SimulatePermissionDenied,
+    KernelResolveBeneathBlock,
+    CanonicalBoundaryViolation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

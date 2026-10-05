@@ -16,6 +16,7 @@ fn test_001_allowed_file_read() {
 
     let allowed_path_str = allowed_file_path.to_str().unwrap().to_string();
     let allowed_pattern = format!("{}/*", allowed_dir.to_str().unwrap());
+    harness.fs_enforcer.register_sandbox_root(&allowed_dir);
 
     // Register Policy
     let policy = Policy::new("policy-fs-001", "Filesystem Access Policy", 1)

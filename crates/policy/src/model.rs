@@ -16,6 +16,23 @@ pub struct PolicyRule {
     pub priority: i32,
 }
 
+use std::path::{Component, Path, PathBuf};
+
+pub fn normalize_lexical_path(p: &str) -> String {
+    let path = Path::new(p);
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c.as_os_str()),
+        }
+    }
+    out.to_string_lossy().to_string()
+}
+
 impl PolicyRule {
     pub fn matches(&self, request: &ActionRequest) -> bool {
         // 1. Agent match
@@ -28,8 +45,19 @@ impl PolicyRule {
             return false;
         }
 
-        // 3. Resource pattern match
-        self.matches_resource(&request.target_resource)
+        // Reject control characters / null bytes in target
+        if request.target_resource.contains('\0') {
+            return false;
+        }
+
+        // 3. Resource pattern match with normalization for file paths
+        let normalized_target = if request.action_type == ActionType::ReadFile || request.action_type == ActionType::WriteFile {
+            normalize_lexical_path(&request.target_resource)
+        } else {
+            request.target_resource.clone()
+        };
+
+        self.matches_resource(&normalized_target)
     }
 
     fn matches_resource(&self, target: &str) -> bool {

@@ -1,8 +1,11 @@
-use blackwall_common::{ActionPayload, ActionRequest, ActionType, Decision, EnforcementAction, ObservedResult};
+use blackwall_common::{ActionPayload, ActionRequest, ActionType, Decision, ObservedResult};
 use blackwall_policy::{Policy, PolicyRule};
 use blackwall_tests::SecurityTestHarness;
 use std::fs;
 use tempfile::tempdir;
+
+const TEST_SECRET_TRAVERSAL: &str = "BLACKWALL_TEST_SECRET_TRAVERSAL_sk99999";
+const TEST_SECRET_SYMLINK: &str = "BLACKWALL_TEST_SECRET_SYMLINK_pass123";
 
 #[test]
 fn test_bypass_attempt_001_path_traversal() {
@@ -14,9 +17,10 @@ fn test_bypass_attempt_001_path_traversal() {
     fs::create_dir_all(&forbidden_dir).expect("Failed to create forbidden dir");
 
     let forbidden_secret_file = forbidden_dir.join("secret.txt");
-    fs::write(&forbidden_secret_file, "HIGHLY_CONFIDENTIAL_KEY=sk-99999-forbidden").expect("Failed to write secret");
+    fs::write(&forbidden_secret_file, TEST_SECRET_TRAVERSAL).expect("Failed to write secret");
 
     let allowed_pattern = format!("{}/*", allowed_dir.to_str().unwrap());
+    harness.fs_enforcer.register_sandbox_root(&allowed_dir);
 
     // Policy allows reading from allowed_dir
     let policy = Policy::new("policy-fs-boundary", "Filesystem Sandbox Policy", 1)
@@ -47,14 +51,24 @@ fn test_bypass_attempt_001_path_traversal() {
     println!("\n=== BYPASS ATTEMPT 1: PATH TRAVERSAL REPORT ===");
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
 
-    // SECURITY INQUISITION:
-    // Did Black Wall allow an uncanonicalized path traversal to leak the forbidden secret?
-    if report.decision == Decision::Allow && report.observed_result == ObservedResult::AccessSuccess {
-        eprintln!(
-            "CRITICAL VULNERABILITY DISCOVERED: Policy engine matched on raw path prefix '{}' without canonicalization, granting access to '{}'!",
-            traversal_payload, forbidden_secret_file.display()
-        );
-    }
+    // HARDENING VERIFICATION:
+    // 1. Observed result must NOT be AccessSuccess
+    assert_ne!(
+        report.observed_result,
+        ObservedResult::AccessSuccess,
+        "SECURITY FAILURE: Path traversal succeeded in accessing forbidden target!"
+    );
+    // 2. Secret marker must never be leaked
+    assert!(
+        !report.logs.contains(TEST_SECRET_TRAVERSAL),
+        "SECURITY FAILURE: Secret marker leaked in logs!"
+    );
+    // 3. Must be blocked by firewall (either policy deny or kernel resolve beneath block)
+    assert_eq!(
+        report.observed_result,
+        ObservedResult::BlockedByFirewall,
+        "Security boundary must physically block traversal"
+    );
 }
 
 #[test]
@@ -67,7 +81,7 @@ fn test_bypass_attempt_002_symlink_escape() {
     fs::create_dir_all(&forbidden_dir).expect("Failed to create forbidden dir");
 
     let forbidden_secret_file = forbidden_dir.join("secret.txt");
-    fs::write(&forbidden_secret_file, "DATABASE_MASTER_PASSWORD=SuperSecret123!").expect("Failed to write secret");
+    fs::write(&forbidden_secret_file, TEST_SECRET_SYMLINK).expect("Failed to write secret");
 
     // Create a symlink inside allowed_dir pointing to forbidden file
     let symlink_in_allowed = allowed_dir.join("link_to_secret.txt");
@@ -75,6 +89,7 @@ fn test_bypass_attempt_002_symlink_escape() {
     std::os::unix::fs::symlink(&forbidden_secret_file, &symlink_in_allowed).expect("Failed to create symlink");
 
     let allowed_pattern = format!("{}/*", allowed_dir.to_str().unwrap());
+    harness.fs_enforcer.register_sandbox_root(&allowed_dir);
 
     let policy = Policy::new("policy-fs-boundary", "Filesystem Sandbox Policy", 1)
         .with_rule(PolicyRule {
@@ -101,10 +116,22 @@ fn test_bypass_attempt_002_symlink_escape() {
     println!("\n=== BYPASS ATTEMPT 2: SYMLINK ESCAPE REPORT ===");
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
 
-    if report.decision == Decision::Allow && report.observed_result == ObservedResult::AccessSuccess {
-        eprintln!(
-            "CRITICAL VULNERABILITY DISCOVERED: Symlink inside allowed boundary points to outside target '{}'!",
-            forbidden_secret_file.display()
-        );
-    }
+    // HARDENING VERIFICATION:
+    // 1. Observed result must NOT be AccessSuccess
+    assert_ne!(
+        report.observed_result,
+        ObservedResult::AccessSuccess,
+        "SECURITY FAILURE: Symlink escape succeeded in accessing forbidden target!"
+    );
+    // 2. Secret marker must never be leaked
+    assert!(
+        !report.logs.contains(TEST_SECRET_SYMLINK),
+        "SECURITY FAILURE: Symlink secret marker leaked in logs!"
+    );
+    // 3. Must be blocked by firewall
+    assert_eq!(
+        report.observed_result,
+        ObservedResult::BlockedByFirewall,
+        "Security boundary must physically block symlink escape"
+    );
 }
