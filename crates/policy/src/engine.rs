@@ -1,10 +1,10 @@
 use std::sync::RwLock;
-use agnes_common::{ActionRequest, ActionType, Decision, DecisionReason, PolicyDecisionResponse};
+use agnes_common::{ActionRequest, Decision, DecisionReason, PolicyDecisionResponse};
 use chrono::Utc;
 use tracing::{debug, info};
 
 use crate::model::{Policy, PolicyRule};
-use crate::path::resolve_real_path;
+use crate::path::resolve_request_target;
 
 #[derive(Default)]
 pub struct PolicyEngine {
@@ -35,39 +35,35 @@ impl PolicyEngine {
     ///
     /// Resolves the REAL, final path (following all symlinks) before evaluating rules.
     pub fn evaluate(&self, request: &ActionRequest) -> PolicyDecisionResponse {
-        // 1. Resolve real, final path following all symlinks for filesystem actions.
-        let (resolved_target, resolved_resource_opt) = if request.action_type == ActionType::ReadFile
-            || request.action_type == ActionType::WriteFile
-        {
-            match resolve_real_path(&request.target_resource) {
-                Ok(path) => {
-                    let s = path.to_string_lossy().to_string();
-                    (s.clone(), Some(s))
-                }
-                Err(err) => {
-                    debug!(
-                        target = %request.target_resource,
-                        error = %err,
-                        "Path resolution failed for filesystem action: fail-closed DENY"
-                    );
-                    return PolicyDecisionResponse {
-                        decision: Decision::Deny,
-                        reason: DecisionReason {
-                            policy_id: "fail-closed-path-resolution".to_string(),
-                            rule_id: None,
-                            explanation: format!(
-                                "Path resolution failed for '{}': {}",
-                                request.target_resource, err
-                            ),
-                        },
-                        matched_policy_id: "fail-closed-path-resolution".to_string(),
-                        evaluated_at: Utc::now(),
-                        resolved_resource: None,
-                    };
-                }
+        // 1. Resolve real, final path following all symlinks for all path-bearing actions.
+        let (resolved_target, resolved_resource_opt) = match resolve_request_target(request) {
+            Ok(Some(path)) => {
+                let s = path.to_string_lossy().to_string();
+                (s.clone(), Some(s))
             }
-        } else {
-            (request.target_resource.clone(), None)
+            Ok(None) => (request.target_resource.clone(), None),
+            Err(err) => {
+                debug!(
+                    target = %request.target_resource,
+                    action = ?request.action_type,
+                    error = %err,
+                    "Path resolution failed for action target: fail-closed DENY"
+                );
+                return PolicyDecisionResponse {
+                    decision: Decision::Deny,
+                    reason: DecisionReason {
+                        policy_id: "fail-closed-path-resolution".to_string(),
+                        rule_id: None,
+                        explanation: format!(
+                            "Path resolution failed for '{}': {}",
+                            request.target_resource, err
+                        ),
+                    },
+                    matched_policy_id: "fail-closed-path-resolution".to_string(),
+                    evaluated_at: Utc::now(),
+                    resolved_resource: None,
+                };
+            }
         };
 
         let guard = self.policies.read().expect("lock poisoned");

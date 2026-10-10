@@ -16,37 +16,17 @@ pub struct PolicyRule {
     pub priority: i32,
 }
 
-use std::path::{Component, Path, PathBuf};
-
-pub fn normalize_lexical_path(p: &str) -> String {
-    let path = Path::new(p);
-    let mut out = PathBuf::new();
-    for comp in path.components() {
-        match comp {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            c => out.push(c.as_os_str()),
-        }
-    }
-    out.to_string_lossy().to_string()
-}
-
-use crate::path::resolve_real_path;
+use crate::path::{is_path_resource, resolve_real_path, resolve_request_target};
 
 impl PolicyRule {
     pub fn matches(&self, request: &ActionRequest) -> bool {
-        let target = if request.action_type == ActionType::ReadFile || request.action_type == ActionType::WriteFile {
-            match resolve_real_path(&request.target_resource) {
-                Ok(resolved) => resolved.to_string_lossy().to_string(),
-                Err(_) => {
-                    // Fail-closed: unresolvable or ambiguous path
-                    return false;
-                }
+        let target = match resolve_request_target(request) {
+            Ok(Some(path)) => path.to_string_lossy().to_string(),
+            Ok(None) => request.target_resource.clone(),
+            Err(_) => {
+                // Fail-closed: unresolvable or ambiguous path
+                return false;
             }
-        } else {
-            request.target_resource.clone()
         };
 
         self.matches_target(request, &target)
@@ -68,8 +48,18 @@ impl PolicyRule {
             return false;
         }
 
-        // 3. Resource pattern match
-        self.matches_resource(target)
+        // 3. Confirm target is fully resolved if this is a path-bearing action
+        let final_target = if is_path_resource(request.action_type, target) {
+            match resolve_real_path(target) {
+                Ok(path) => path.to_string_lossy().to_string(),
+                Err(_) => return false, // Fail-closed: unresolvable or ambiguous path
+            }
+        } else {
+            target.to_string()
+        };
+
+        // 4. Resource pattern match
+        self.matches_resource(&final_target)
     }
 
     pub fn matches_resource(&self, target: &str) -> bool {
@@ -82,7 +72,7 @@ impl PolicyRule {
             if target.starts_with(prefix) && (target.len() == prefix.len() || target[prefix.len()..].starts_with('/')) {
                 return true;
             }
-            if let Ok(canon_prefix) = Path::new(prefix).canonicalize() {
+            if let Ok(canon_prefix) = resolve_real_path(prefix) {
                 let canon_str = canon_prefix.to_string_lossy();
                 let canon_str = canon_str.trim_end_matches('/');
                 if target.starts_with(canon_str) && (target.len() == canon_str.len() || target[canon_str.len()..].starts_with('/')) {
@@ -96,7 +86,7 @@ impl PolicyRule {
             if target.starts_with(prefix) {
                 return true;
             }
-            if let Ok(canon_prefix) = Path::new(prefix).canonicalize() {
+            if let Ok(canon_prefix) = resolve_real_path(prefix) {
                 let canon_str = canon_prefix.to_string_lossy();
                 if target.starts_with(canon_str.as_ref()) {
                     return true;
@@ -109,7 +99,7 @@ impl PolicyRule {
         if self.resource_pattern == target {
             return true;
         }
-        if let Ok(canon_pat) = Path::new(&self.resource_pattern).canonicalize() {
+        if let Ok(canon_pat) = resolve_real_path(&self.resource_pattern) {
             if canon_pat.to_string_lossy() == target {
                 return true;
             }

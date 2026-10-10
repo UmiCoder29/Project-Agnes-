@@ -225,3 +225,134 @@ fn test_regression_symlink_inside_allowed_pointing_to_denied_evaluated_against_d
         "Protected data must never be leaked in logs"
     );
 }
+
+// REGRESSION: Nested/chained symlinks (symlink -> symlink -> denied path)
+// must be evaluated against the denied path's policy and rejected (Decision::Deny).
+#[test]
+fn test_regression_nested_chained_symlinks_pointing_to_denied_path_evaluated_against_denied_policy_and_rejected() {
+    let harness = SecurityTestHarness::new();
+    let temp_dir = tempdir().expect("Failed to create tempdir");
+    let sandbox_root = temp_dir.path();
+    let allowed_dir = sandbox_root.join("allowed_zone");
+    let denied_dir = sandbox_root.join("denied_zone");
+    fs::create_dir_all(&allowed_dir).expect("Failed to create allowed dir");
+    fs::create_dir_all(&denied_dir).expect("Failed to create denied dir");
+
+    let denied_file = denied_dir.join("protected_chained_record.txt");
+    fs::write(&denied_file, "RESTRICTED_DATA_CHAINED_SYMLINK").expect("Failed to write denied file");
+
+    // Chained symlink: hop 1 points to hop 2, which points to the denied path
+    let hop2_symlink = allowed_dir.join("intermediate_hop.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("../denied_zone/protected_chained_record.txt", &hop2_symlink)
+        .expect("Failed to create intermediate symlink hop");
+
+    let hop1_symlink = allowed_dir.join("chained_entrypoint.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("intermediate_hop.txt", &hop1_symlink)
+        .expect("Failed to create chained entrypoint symlink");
+
+    // Both directories are under the enclosing root
+    harness.fs_enforcer.register_sandbox_root(&sandbox_root);
+
+    // Register Policy with:
+    // 1. Explicit DENY rule on denied_zone/* (Priority 100) for ReadFile, WriteFile, ReadSecret
+    // 2. Explicit ALLOW rule on allowed_zone/* (Priority 10) for ReadFile, WriteFile, ReadSecret
+    let policy = Policy::new("policy-chained-symlink-prevention", "Chained Symlink Bypass Policy", 1)
+        .with_rule(PolicyRule {
+            id: "rule-deny-sensitive-dir".to_string(),
+            description: "Explicitly deny all access to denied_zone".to_string(),
+            decision: Decision::Deny,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile, ActionType::WriteFile, ActionType::ReadSecret],
+            resource_pattern: format!("{}/*", denied_dir.display()),
+            priority: 100,
+        })
+        .with_rule(PolicyRule {
+            id: "rule-allow-sandbox-dir".to_string(),
+            description: "Allow access inside allowed_zone".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile, ActionType::WriteFile, ActionType::ReadSecret],
+            resource_pattern: format!("{}/*", allowed_dir.display()),
+            priority: 10,
+        });
+
+    harness.policy_engine.add_policy(policy);
+
+    // 1. Verify ReadFile with chained symlink: must resolve to denied file and Deny
+    let read_req = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: hop1_symlink.to_str().unwrap().to_string(),
+        },
+    ).with_test_id("REGRESSION-CHAINED-READ-001");
+
+    let report = harness.execute_request(read_req);
+    assert_eq!(
+        report.decision,
+        Decision::Deny,
+        "SECURITY BYPASS: Chained symlink read was not rejected by policy!"
+    );
+    assert_eq!(
+        report.observed_result,
+        ObservedResult::BlockedByFirewall,
+        "Chained symlink read must be blocked by firewall"
+    );
+    assert!(
+        !report.logs.contains("RESTRICTED_DATA_CHAINED_SYMLINK"),
+        "Protected data must never be leaked"
+    );
+
+    // 2. Verify ReadSecret with chained symlink path: must resolve to denied file and Deny
+    let secret_hop2 = allowed_dir.join("intermediate_secret_hop.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("../denied_zone/protected_chained_record.txt", &secret_hop2)
+        .expect("Failed to create intermediate secret symlink");
+
+    let secret_hop1 = allowed_dir.join("chained_secret_entrypoint.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("intermediate_secret_hop.txt", &secret_hop1)
+        .expect("Failed to create chained secret entrypoint");
+
+    let secret_req = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadSecret {
+            secret_id: secret_hop1.to_str().unwrap().to_string(),
+        },
+    ).with_test_id("REGRESSION-CHAINED-SECRET-001");
+
+    let secret_decision = harness.policy_engine.evaluate(&secret_req);
+    assert_eq!(
+        secret_decision.decision,
+        Decision::Deny,
+        "SECURITY BYPASS: ReadSecret path with chained symlink was not evaluated against denied policy and rejected!"
+    );
+
+    // 3. Verify WriteFile stub path with chained symlink: must resolve to denied file and Deny
+    let write_hop2 = allowed_dir.join("intermediate_write_hop.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("../denied_zone/new_write_target.txt", &write_hop2)
+        .expect("Failed to create intermediate write symlink");
+
+    let write_hop1 = allowed_dir.join("chained_write_entrypoint.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("intermediate_write_hop.txt", &write_hop1)
+        .expect("Failed to create chained write entrypoint");
+
+    let write_req = ActionRequest::new(
+        "agent-001",
+        ActionPayload::WriteFile {
+            path: write_hop1.to_str().unwrap().to_string(),
+            content: "UNAUTHORIZED_WRITE".to_string(),
+        },
+    ).with_test_id("REGRESSION-CHAINED-WRITE-001");
+
+    let write_decision = harness.policy_engine.evaluate(&write_req);
+    assert_eq!(
+        write_decision.decision,
+        Decision::Deny,
+        "SECURITY BYPASS: WriteFile path with chained symlink was not evaluated against denied policy and rejected!"
+    );
+}
+

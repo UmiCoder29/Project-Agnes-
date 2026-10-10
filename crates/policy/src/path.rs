@@ -1,8 +1,43 @@
 use std::fs;
 use std::io::{Error, ErrorKind};
 use std::path::{Component, Path, PathBuf};
+use agnes_common::{ActionRequest, ActionType};
 
 const MAX_SYMLINK_DEPTH: u32 = 32;
+
+/// Determines whether an action request targets a resource that represents a filesystem path.
+///
+/// Filesystem actions (ReadFile, WriteFile) are always path-bearing.
+/// ReadSecret is path-bearing if its target resource is a filesystem path (e.g., /run/secrets/...,
+/// ./keys/..., or references an existing filesystem entity).
+pub fn is_path_resource(action_type: ActionType, resource: &str) -> bool {
+    match action_type {
+        ActionType::ReadFile | ActionType::WriteFile => true,
+        ActionType::ReadSecret => {
+            resource.starts_with('/')
+                || resource.starts_with('.')
+                || resource.contains('/')
+                || resource.contains('\\')
+                || Path::new(resource).exists()
+                || fs::symlink_metadata(resource).is_ok()
+        }
+        _ => false,
+    }
+}
+
+/// Resolves an ActionRequest target to its real, final canonical path on the filesystem
+/// if the action is path-bearing.
+///
+/// Returns Ok(Some(PathBuf)) if it is a path-bearing action and was resolved.
+/// Returns Ok(None) if the action does not target a filesystem path.
+/// Returns Err(Error) if path resolution fails (e.g. symlink loop, null byte, inaccessible).
+pub fn resolve_request_target(request: &ActionRequest) -> Result<Option<PathBuf>, Error> {
+    if is_path_resource(request.action_type, &request.target_resource) {
+        resolve_real_path(&request.target_resource).map(Some)
+    } else {
+        Ok(None)
+    }
+}
 
 /// Resolves a path to its real, final canonical path on the filesystem,
 /// following all symbolic links, stripping redundant separators, and
@@ -21,6 +56,7 @@ pub fn resolve_real_path(raw_path: &str) -> Result<PathBuf, Error> {
 
     resolve_real_path_bounded(Path::new(trimmed), 0)
 }
+
 
 fn resolve_real_path_bounded(path: &Path, depth: u32) -> Result<PathBuf, Error> {
     if depth > MAX_SYMLINK_DEPTH {
