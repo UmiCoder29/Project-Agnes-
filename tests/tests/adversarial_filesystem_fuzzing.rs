@@ -1,13 +1,13 @@
-use blackwall_common::{
+use agnes_common::{
     ActionPayload, ActionRequest, ActionType, Decision, ObservedResult,
 };
-use blackwall_policy::{Policy, PolicyRule};
-use blackwall_tests::SecurityTestHarness;
+use agnes_policy::{Policy, PolicyRule};
+use agnes_tests::SecurityTestHarness;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::tempdir;
 
-const FUZZ_SECRET_CANARY: &str = "BLACKWALL_FUZZ_FORBIDDEN_CANARY_X999";
+const FUZZ_SECRET_CANARY: &str = "AGNES_FUZZ_FORBIDDEN_CANARY_X999";
 
 struct FuzzEnv {
     _temp: tempfile::TempDir,

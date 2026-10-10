@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-blackwall-common = { path = "../../crates/common" }
+agnes-common = { path = "../../crates/common" }
 tokio.workspace = true
 reqwest.workspace = true
 serde.workspace = true

@@ -1,6 +1,6 @@
-use blackwall_common::{ActionPayload, ActionRequest, ActionType, Decision, EnforcementAction, ObservedResult};
-use blackwall_policy::{Policy, PolicyRule};
-use blackwall_tests::SecurityTestHarness;
+use agnes_common::{ActionPayload, ActionRequest, ActionType, Decision, EnforcementAction, ObservedResult};
+use agnes_policy::{Policy, PolicyRule};
+use agnes_tests::SecurityTestHarness;
 use std::fs;
 use tempfile::tempdir;
 
@@ -40,7 +40,7 @@ fn test_001_allowed_file_read() {
         },
     ).with_test_id("TEST-001");
 
-    // Execute through Black Wall
+    // Execute through Project Agnes
     let report = harness.execute_request(request);
 
     println!("\n=== TEST 001 AUDIT RECORD ===");
@@ -87,7 +87,7 @@ fn test_002_forbidden_file_read() {
         },
     ).with_test_id("TEST-002");
 
-    // Execute through Black Wall
+    // Execute through Project Agnes
     let report = harness.execute_request(request);
 
     println!("\n=== TEST 002 AUDIT RECORD ===");

@@ -8,13 +8,13 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use blackwall_common::{
+use agnes_common::{
     ActionRequest, ActionType, Decision, EnforcementAction, ObservedResult, SecurityEvent,
 };
-use blackwall_enforcement::{EnforcementResult, FilesystemEnforcer};
-use blackwall_policy::{Policy, PolicyEngine};
-use blackwall_state::StateEngine;
-use blackwall_telemetry::{InMemoryTelemetrySink, StructuredJsonLogSink, TelemetrySink};
+use agnes_enforcement::{EnforcementResult, FilesystemEnforcer};
+use agnes_policy::{Policy, PolicyEngine};
+use agnes_state::StateEngine;
+use agnes_telemetry::{InMemoryTelemetrySink, StructuredJsonLogSink, TelemetrySink};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer().json())
         .init();
 
-    info!("Starting Black Wall Runtime Security Core v0.1");
+    info!("Starting Project Agnes Runtime Security Core v0.1");
 
     let state = Arc::new(AppState {
         policy_engine: PolicyEngine::new(),
@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string()).parse::<u16>()?;
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!("Black Wall Gateway listening on {}", addr);
+    info!("Project Agnes Gateway listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn health_handler() -> impl IntoResponse {
-    (StatusCode::OK, Json(serde_json::json!({ "status": "UP", "version": "0.1.0", "component": "blackwall-core" })))
+    (StatusCode::OK, Json(serde_json::json!({ "status": "UP", "version": "0.1.0", "component": "agnes-core" })))
 }
 
 async fn add_policy_handler(

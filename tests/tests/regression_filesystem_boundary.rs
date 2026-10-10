@@ -1,8 +1,8 @@
-use blackwall_common::{
+use agnes_common::{
     ActionPayload, ActionRequest, ActionType, Decision, EnforcementAction, ObservedResult,
 };
-use blackwall_policy::{Policy, PolicyRule};
-use blackwall_tests::SecurityTestHarness;
+use agnes_policy::{Policy, PolicyRule};
+use agnes_tests::SecurityTestHarness;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -444,7 +444,7 @@ fn test_regression_015_concurrent_toctou_race() {
         }
     });
 
-    // Defender Thread (Process A): Executes requests through Black Wall during active attacker race
+    // Defender Thread (Process A): Executes requests through Project Agnes during active attacker race
     barrier.wait();
     for i in 0..100 {
         let req = ActionRequest::new(

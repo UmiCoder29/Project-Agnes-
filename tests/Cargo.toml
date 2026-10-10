@@ -1,16 +1,16 @@
 [package]
-name = "blackwall-tests"
+name = "agnes-tests"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [dependencies]
-blackwall-common = { path = "../crates/common" }
-blackwall-policy = { path = "../crates/policy" }
-blackwall-enforcement = { path = "../crates/enforcement" }
-blackwall-state = { path = "../crates/state" }
-blackwall-telemetry = { path = "../crates/telemetry" }
+agnes-common = { path = "../crates/common" }
+agnes-policy = { path = "../crates/policy" }
+agnes-enforcement = { path = "../crates/enforcement" }
+agnes-state = { path = "../crates/state" }
+agnes-telemetry = { path = "../crates/telemetry" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -1,11 +1,75 @@
-target/
+# Build Artifacts & Rust Targets
+/target/
 **/*.rs.bk
-Cargo.lock
+*.rlib
+*.so
+*.dylib
+*.dll
+*.o
+*.out
+
+# Environment & Config
 .env
+.env.*
+*.env
+*.env.local
+*.env.development.local
+*.env.test.local
+*.env.production.local
+
+# Secrets, Certificates & Credentials
+*.key
+*.pem
+*.crt
+*.cer
+*.der
+*.pfx
+*.p12
+*.asc
+*.token
+*.credential
+*.credentials
+id_rsa*
+id_ed25519*
+*.keystore
+secrets/
+credentials/
+.secrets/
+
+# Dependencies
+node_modules/
+vendor/
+
+# Database & Runtime Data Volumes
+postgres-data/
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+
+# Python Caches & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDEs & Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs & Temporary Files
 *.log
-research/benchmarks/*
-research/openshell/*
-research/defenseclaw/*
-!research/benchmarks/.gitkeep
-!research/openshell/.gitkeep
-!research/defenseclaw/.gitkeep
+tmp/
+temp/

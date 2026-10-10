@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use blackwall_common::SecurityEvent;
+use agnes_common::SecurityEvent;
 use std::sync::RwLock;
 use tracing::info;
 
@@ -14,7 +14,7 @@ pub struct StructuredJsonLogSink;
 impl TelemetrySink for StructuredJsonLogSink {
     async fn record_event(&self, event: &SecurityEvent) -> Result<(), String> {
         let serialized = serde_json::to_string(event).map_err(|e| e.to_string())?;
-        info!(target: "blackwall::telemetry", "{}", serialized);
+        info!(target: "agnes::telemetry", "{}", serialized);
         Ok(())
     }
 }

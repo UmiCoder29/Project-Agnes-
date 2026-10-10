@@ -1,4 +1,4 @@
-use blackwall_common::{
+use agnes_common::{
     ActionPayload, ActionRequest, Decision, EnforcementAction, ObservedResult, PolicyDecisionResponse,
 };
 use std::ffi::CString;
@@ -85,7 +85,7 @@ impl FilesystemEnforcer {
                 observed_result: ObservedResult::BlockedByFirewall,
                 output: None,
                 error_message: Some(format!(
-                    "EACCES: Black Wall denied access to '{}'. Policy: {}",
+                    "EACCES: Project Agnes denied access to '{}'. Policy: {}",
                     raw_path, decision_resp.matched_policy_id
                 )),
             };

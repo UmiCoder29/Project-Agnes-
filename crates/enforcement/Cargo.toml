@@ -1,13 +1,13 @@
 [package]
-name = "blackwall-enforcement"
+name = "agnes-enforcement"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [dependencies]
-blackwall-common = { path = "../common" }
-blackwall-policy = { path = "../policy" }
+agnes-common = { path = "../common" }
+agnes-policy = { path = "../policy" }
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true

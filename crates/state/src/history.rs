@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
-use blackwall_common::SecurityEvent;
+use agnes_common::SecurityEvent;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 

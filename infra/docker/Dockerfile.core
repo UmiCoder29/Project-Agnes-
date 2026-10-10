@@ -1,20 +1,20 @@
 FROM rust:1.80-slim as builder
 
-WORKDIR /usr/src/blackwall
+WORKDIR /usr/src/agnes
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY apps ./apps
 COPY tests ./tests
 
-RUN cargo build --release --bin blackwall-core
+RUN cargo build --release --bin agnes-core
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=builder /usr/src/blackwall/target/release/blackwall-core /usr/local/bin/blackwall-core
+COPY --from=builder /usr/src/agnes/target/release/agnes-core /usr/local/bin/agnes-core
 
 ENV PORT=8080
 EXPOSE 8080
 
-CMD ["blackwall-core"]
+CMD ["agnes-core"]

@@ -1,4 +1,4 @@
--- BLACK WALL v0.1 DATABASE SCHEMA
+-- PROJECT AGNES v0.1 DATABASE SCHEMA
 -- PostgreSQL Persistence Layer for Security State, Telemetry, and Experiments
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -175,5 +175,5 @@ CREATE TABLE IF NOT EXISTS benchmarks (
 
 -- Seed initial test agents
 INSERT INTO agents (agent_id, name, description)
-VALUES ('agent-001', 'Primary Test Mock Agent', 'Deterministic test agent for Black Wall experiments')
+VALUES ('agent-001', 'Primary Test Mock Agent', 'Deterministic test agent for Project Agnes experiments')
 ON CONFLICT (agent_id) DO NOTHING;

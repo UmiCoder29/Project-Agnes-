@@ -2,7 +2,7 @@
 
 - **Date**: 2026-10-05
 - **Experiment ID**: EXP-001 / EXP-002
-- **Component**: Black Wall Filesystem Security Boundary & Gateway
+- **Component**: Project Agnes Filesystem Security Boundary & Gateway
 - **Target Actions**: `READ_FILE`
 
 ---

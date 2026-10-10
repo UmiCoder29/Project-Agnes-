@@ -1,11 +1,11 @@
-use blackwall_common::{ActionPayload, ActionRequest, ActionType, Decision, ObservedResult};
-use blackwall_policy::{Policy, PolicyRule};
-use blackwall_tests::SecurityTestHarness;
+use agnes_common::{ActionPayload, ActionRequest, ActionType, Decision, ObservedResult};
+use agnes_policy::{Policy, PolicyRule};
+use agnes_tests::SecurityTestHarness;
 use std::fs;
 use tempfile::tempdir;
 
-const TEST_SECRET_TRAVERSAL: &str = "BLACKWALL_TEST_SECRET_TRAVERSAL_sk99999";
-const TEST_SECRET_SYMLINK: &str = "BLACKWALL_TEST_SECRET_SYMLINK_pass123";
+const TEST_SECRET_TRAVERSAL: &str = "AGNES_TEST_SECRET_TRAVERSAL_sk99999";
+const TEST_SECRET_SYMLINK: &str = "AGNES_TEST_SECRET_SYMLINK_pass123";
 
 #[test]
 fn test_bypass_attempt_001_path_traversal() {

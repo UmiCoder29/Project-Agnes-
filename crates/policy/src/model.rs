@@ -1,4 +1,4 @@
-use blackwall_common::{ActionRequest, ActionType, Decision};
+use agnes_common::{ActionRequest, ActionType, Decision};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

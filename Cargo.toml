@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "apps/blackwall-core",
+    "apps/agnes-core",
     "apps/mock-agent",
     "crates/common",
     "crates/policy",
@@ -14,8 +14,8 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["Black Wall Team"]
-license = "Apache-2.0"
+authors = ["Project Agnes Team"]
+license = "MIT"
 
 [workspace.dependencies]
 tokio = { version = "1.40", features = ["full"] }

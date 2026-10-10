@@ -1,4 +1,4 @@
-use blackwall_common::{ActionPayload, ActionRequest};
+use agnes_common::{ActionPayload, ActionRequest};
 use serde_json::Value;
 use std::env;
 use tracing::info;
@@ -28,7 +28,7 @@ impl MockAgent {
             agent = %self.agent_id,
             action = ?request.action_type,
             resource = %request.target_resource,
-            "Mock agent sending action to Black Wall Gateway"
+            "Mock agent sending action to Project Agnes Gateway"
         );
 
         let endpoint = format!("{}/v1/action", self.gateway_url);
@@ -36,7 +36,7 @@ impl MockAgent {
         let status = resp.status();
         let body: Value = resp.json().await?;
 
-        info!(status = %status, response = ?body, "Received response from Black Wall Gateway");
+        info!(status = %status, response = ?body, "Received response from Project Agnes Gateway");
         Ok(body)
     }
 
@@ -148,7 +148,9 @@ impl MockAgent {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let agent_id = env::var("AGENT_ID").unwrap_or_else(|_| "mock-agent-001".to_string());
-    let gateway_url = env::var("BLACKWALL_GATEWAY_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+    let gateway_url = env::var("AGNES_GATEWAY_URL")
+        .or_else(|_| env::var("BLACKWALL_GATEWAY_URL"))
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
 
     let agent = MockAgent::new(agent_id, gateway_url);
     info!("Mock agent initialized. Ready to generate security actions.");

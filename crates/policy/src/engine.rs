@@ -1,5 +1,5 @@
 use std::sync::RwLock;
-use blackwall_common::{ActionRequest, Decision, DecisionReason, PolicyDecisionResponse};
+use agnes_common::{ActionRequest, Decision, DecisionReason, PolicyDecisionResponse};
 use chrono::Utc;
 use tracing::{debug, info};
 

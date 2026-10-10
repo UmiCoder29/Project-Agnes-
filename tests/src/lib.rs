@@ -1,10 +1,10 @@
-use blackwall_common::{
+use agnes_common::{
     ActionRequest, ActionType, Decision, EnforcementAction, ObservedResult, SecurityEvent,
 };
-use blackwall_enforcement::FilesystemEnforcer;
-use blackwall_policy::PolicyEngine;
-use blackwall_state::StateEngine;
-use blackwall_telemetry::InMemoryTelemetrySink;
+use agnes_enforcement::FilesystemEnforcer;
+use agnes_policy::PolicyEngine;
+use agnes_state::StateEngine;
+use agnes_telemetry::InMemoryTelemetrySink;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
