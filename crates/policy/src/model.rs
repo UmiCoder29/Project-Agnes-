@@ -33,8 +33,26 @@ pub fn normalize_lexical_path(p: &str) -> String {
     out.to_string_lossy().to_string()
 }
 
+use crate::path::resolve_real_path;
+
 impl PolicyRule {
     pub fn matches(&self, request: &ActionRequest) -> bool {
+        let target = if request.action_type == ActionType::ReadFile || request.action_type == ActionType::WriteFile {
+            match resolve_real_path(&request.target_resource) {
+                Ok(resolved) => resolved.to_string_lossy().to_string(),
+                Err(_) => {
+                    // Fail-closed: unresolvable or ambiguous path
+                    return false;
+                }
+            }
+        } else {
+            request.target_resource.clone()
+        };
+
+        self.matches_target(request, &target)
+    }
+
+    pub fn matches_target(&self, request: &ActionRequest, target: &str) -> bool {
         // 1. Agent match
         if self.agent_pattern != "*" && self.agent_pattern != request.agent_id {
             return false;
@@ -46,35 +64,58 @@ impl PolicyRule {
         }
 
         // Reject control characters / null bytes in target
-        if request.target_resource.contains('\0') {
+        if target.contains('\0') {
             return false;
         }
 
-        // 3. Resource pattern match with normalization for file paths
-        let normalized_target = if request.action_type == ActionType::ReadFile || request.action_type == ActionType::WriteFile {
-            normalize_lexical_path(&request.target_resource)
-        } else {
-            request.target_resource.clone()
-        };
-
-        self.matches_resource(&normalized_target)
+        // 3. Resource pattern match
+        self.matches_resource(target)
     }
 
-    fn matches_resource(&self, target: &str) -> bool {
+    pub fn matches_resource(&self, target: &str) -> bool {
         if self.resource_pattern == "*" {
             return true;
         }
 
         if let Some(prefix) = self.resource_pattern.strip_suffix("/*") {
-            return target.starts_with(prefix) && (target.len() == prefix.len() || target[prefix.len()..].starts_with('/'));
+            let prefix = prefix.trim_end_matches('/');
+            if target.starts_with(prefix) && (target.len() == prefix.len() || target[prefix.len()..].starts_with('/')) {
+                return true;
+            }
+            if let Ok(canon_prefix) = Path::new(prefix).canonicalize() {
+                let canon_str = canon_prefix.to_string_lossy();
+                let canon_str = canon_str.trim_end_matches('/');
+                if target.starts_with(canon_str) && (target.len() == canon_str.len() || target[canon_str.len()..].starts_with('/')) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         if let Some(prefix) = self.resource_pattern.strip_suffix('*') {
-            return target.starts_with(prefix);
+            if target.starts_with(prefix) {
+                return true;
+            }
+            if let Ok(canon_prefix) = Path::new(prefix).canonicalize() {
+                let canon_str = canon_prefix.to_string_lossy();
+                if target.starts_with(canon_str.as_ref()) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         // Exact match
-        self.resource_pattern == target
+        if self.resource_pattern == target {
+            return true;
+        }
+        if let Ok(canon_pat) = Path::new(&self.resource_pattern).canonicalize() {
+            if canon_pat.to_string_lossy() == target {
+                return true;
+            }
+        }
+
+        false
     }
 }
 

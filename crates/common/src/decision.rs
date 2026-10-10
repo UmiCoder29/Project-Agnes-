@@ -20,4 +20,6 @@ pub struct PolicyDecisionResponse {
     pub reason: DecisionReason,
     pub matched_policy_id: String,
     pub evaluated_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_resource: Option<String>,
 }

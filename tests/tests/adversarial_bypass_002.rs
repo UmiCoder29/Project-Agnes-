@@ -1,4 +1,4 @@
-use agnes_common::{ActionPayload, ActionRequest, ActionType, Decision, ObservedResult};
+use agnes_common::{ActionPayload, ActionRequest, ActionType, Decision, EnforcementAction, ObservedResult};
 use agnes_policy::{Policy, PolicyRule};
 use agnes_tests::SecurityTestHarness;
 use std::fs;
@@ -133,5 +133,95 @@ fn test_bypass_attempt_002_symlink_escape() {
         report.observed_result,
         ObservedResult::BlockedByFirewall,
         "Security boundary must physically block symlink escape"
+    );
+}
+
+// REGRESSION: A symlink inside an allowed directory that points into a denied directory
+// must be evaluated against the denied directory's policy and rejected (Decision::Deny).
+#[test]
+fn test_regression_symlink_inside_allowed_pointing_to_denied_evaluated_against_denied_policy_and_rejected() {
+    let harness = SecurityTestHarness::new();
+    let temp_dir = tempdir().expect("Failed to create tempdir");
+    let sandbox_root = temp_dir.path();
+    let allowed_dir = sandbox_root.join("allowed_zone");
+    let denied_dir = sandbox_root.join("denied_zone");
+    fs::create_dir_all(&allowed_dir).expect("Failed to create allowed dir");
+    fs::create_dir_all(&denied_dir).expect("Failed to create denied dir");
+
+    let denied_file = denied_dir.join("protected_record.txt");
+    fs::write(&denied_file, "RESTRICTED_DATA_INTERNAL_USE_ONLY").expect("Failed to write denied file");
+
+    let symlink_in_allowed = allowed_dir.join("relative_leak_link.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("../denied_zone/protected_record.txt", &symlink_in_allowed)
+        .expect("Failed to create relative symlink");
+
+    // Both directories are under the enclosing root
+    harness.fs_enforcer.register_sandbox_root(&sandbox_root);
+
+    // Register Policy with:
+    // 1. Explicit DENY rule on denied_zone/* (Priority 100)
+    // 2. Explicit ALLOW rule on allowed_zone/* (Priority 10)
+    let policy = Policy::new("policy-symlink-bypass-prevention", "Symlink Bypass Test Policy", 1)
+        .with_rule(PolicyRule {
+            id: "rule-deny-sensitive-dir".to_string(),
+            description: "Explicitly deny all access to denied_zone".to_string(),
+            decision: Decision::Deny,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/*", denied_dir.display()),
+            priority: 100,
+        })
+        .with_rule(PolicyRule {
+            id: "rule-allow-sandbox-dir".to_string(),
+            description: "Allow reading inside allowed_zone".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/*", allowed_dir.display()),
+            priority: 10,
+        });
+
+    harness.policy_engine.add_policy(policy);
+
+    // Action request targets the symlink located inside allowed directory
+    let request = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: symlink_in_allowed.to_str().unwrap().to_string(),
+        },
+    ).with_test_id("REGRESSION-SYMLINK-BYPASS-001");
+
+    let report = harness.execute_request(request);
+
+    println!("\n=== REGRESSION REPORT: SYMLINK TO DENIED DIRECTORY ===");
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+
+    // CRITICAL ASSERTIONS:
+    // The policy evaluation must resolve the REAL path (following the symlink to denied_zone)
+    // before the policy decision is made, rejecting the access via rule-deny-sensitive-dir.
+    assert_eq!(
+        report.decision,
+        Decision::Deny,
+        "SECURITY BYPASS DETECTED: Symlink pointing into denied directory was not rejected by policy!"
+    );
+    assert_eq!(
+        report.policy,
+        "policy-symlink-bypass-prevention",
+        "Must match the policy containing the deny rule"
+    );
+    assert_eq!(
+        report.enforcement,
+        EnforcementAction::BlockRequest,
+        "Enforcement must block request upon policy denial"
+    );
+    assert_eq!(
+        report.observed_result,
+        ObservedResult::BlockedByFirewall,
+        "Observed result must be BlockedByFirewall"
+    );
+    assert!(
+        !report.logs.contains("RESTRICTED_DATA_INTERNAL_USE_ONLY"),
+        "Protected data must never be leaked in logs"
     );
 }

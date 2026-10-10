@@ -1,9 +1,10 @@
 use std::sync::RwLock;
-use agnes_common::{ActionRequest, Decision, DecisionReason, PolicyDecisionResponse};
+use agnes_common::{ActionRequest, ActionType, Decision, DecisionReason, PolicyDecisionResponse};
 use chrono::Utc;
 use tracing::{debug, info};
 
 use crate::model::{Policy, PolicyRule};
+use crate::path::resolve_real_path;
 
 #[derive(Default)]
 pub struct PolicyEngine {
@@ -31,14 +32,51 @@ impl PolicyEngine {
     /// Evaluates an ActionRequest deterministically.
     /// Default is FAIL-CLOSED (Deny).
     /// Deny takes precedence over Allow at equal priority.
+    ///
+    /// Resolves the REAL, final path (following all symlinks) before evaluating rules.
     pub fn evaluate(&self, request: &ActionRequest) -> PolicyDecisionResponse {
+        // 1. Resolve real, final path following all symlinks for filesystem actions.
+        let (resolved_target, resolved_resource_opt) = if request.action_type == ActionType::ReadFile
+            || request.action_type == ActionType::WriteFile
+        {
+            match resolve_real_path(&request.target_resource) {
+                Ok(path) => {
+                    let s = path.to_string_lossy().to_string();
+                    (s.clone(), Some(s))
+                }
+                Err(err) => {
+                    debug!(
+                        target = %request.target_resource,
+                        error = %err,
+                        "Path resolution failed for filesystem action: fail-closed DENY"
+                    );
+                    return PolicyDecisionResponse {
+                        decision: Decision::Deny,
+                        reason: DecisionReason {
+                            policy_id: "fail-closed-path-resolution".to_string(),
+                            rule_id: None,
+                            explanation: format!(
+                                "Path resolution failed for '{}': {}",
+                                request.target_resource, err
+                            ),
+                        },
+                        matched_policy_id: "fail-closed-path-resolution".to_string(),
+                        evaluated_at: Utc::now(),
+                        resolved_resource: None,
+                    };
+                }
+            }
+        } else {
+            (request.target_resource.clone(), None)
+        };
+
         let guard = self.policies.read().expect("lock poisoned");
 
         let mut matching_rules: Vec<(&Policy, &PolicyRule)> = Vec::new();
 
         for policy in guard.iter() {
             for rule in &policy.rules {
-                if rule.matches(request) {
+                if rule.matches_target(request, &resolved_target) {
                     matching_rules.push((policy, rule));
                 }
             }
@@ -49,6 +87,7 @@ impl PolicyEngine {
                 agent = %request.agent_id,
                 action = ?request.action_type,
                 resource = %request.target_resource,
+                resolved = %resolved_target,
                 "No matching rule found: default FAIL-CLOSED deny"
             );
 
@@ -62,6 +101,7 @@ impl PolicyEngine {
                 },
                 matched_policy_id: "default-fail-closed".to_string(),
                 evaluated_at: Utc::now(),
+                resolved_resource: resolved_resource_opt,
             };
         }
 
@@ -90,6 +130,7 @@ impl PolicyEngine {
             decision = ?chosen_rule.decision,
             policy = %chosen_policy.id,
             rule = %chosen_rule.id,
+            resolved = %resolved_target,
             "Policy decision reached"
         );
 
@@ -105,6 +146,7 @@ impl PolicyEngine {
             },
             matched_policy_id: chosen_policy.id.clone(),
             evaluated_at: Utc::now(),
+            resolved_resource: resolved_resource_opt,
         }
     }
 }
