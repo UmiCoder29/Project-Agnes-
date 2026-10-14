@@ -475,3 +475,80 @@ fn test_regression_015_concurrent_toctou_race() {
 
     attacker_handle.join().unwrap();
 }
+
+// REGRESSION-016: Whitespace-trimming mismatch between policy resolution and enforcement.
+// Files with leading/trailing whitespace must be rejected at the policy boundary (failing closed)
+// rather than silently trimmed and matched against a policy rule.
+#[test]
+fn test_regression_016_whitespace_trimming_mismatch() {
+    let temp = tempdir().expect("tempdir failed");
+    let allowed_dir = temp.path().join("allowed");
+    fs::create_dir_all(&allowed_dir).expect("mkdir allowed");
+
+    let harness = SecurityTestHarness::new();
+    harness.fs_enforcer.register_sandbox_root(&allowed_dir);
+
+    // Create a file with a trailing space in its name
+    let file_with_trailing_space = allowed_dir.join("sensitive_file.txt ");
+    fs::write(&file_with_trailing_space, "RESTRICTED_DATA_WHITESPACE").unwrap();
+
+    let file_with_space_str = file_with_trailing_space.to_str().unwrap().to_string();
+
+    // Register a policy that denies access to the file by exact path, and allows sandbox directory
+    let policy = Policy::new("policy-whitespace-test", "Whitespace Boundary Policy", 1)
+        .with_rule(PolicyRule {
+            id: "rule-deny-exact-space".to_string(),
+            description: "Deny exact path of file with trailing space".to_string(),
+            decision: Decision::Deny,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: file_with_space_str.clone(),
+            priority: 100,
+        })
+        .with_rule(PolicyRule {
+            id: "rule-allow-sandbox".to_string(),
+            description: "Allow sandbox access".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/*", allowed_dir.display()),
+            priority: 10,
+        });
+
+    harness.policy_engine.add_policy(policy);
+
+    let req = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: file_with_space_str.clone(),
+        },
+    ).with_test_id("REGRESSION-016");
+
+    let report = harness.execute_request(req);
+
+    // Assertions:
+    // 1. The request must be denied and blocked by firewall
+    assert_eq!(report.decision, Decision::Deny);
+    assert_eq!(report.observed_result, ObservedResult::BlockedByFirewall);
+    assert_eq!(report.enforcement, EnforcementAction::BlockRequest);
+
+    // 2. Fail-closed at policy boundary:
+    // Requesting the untrimmed path must be rejected at the policy boundary (fail-closed-path-resolution),
+    // rather than being silently trimmed and matched against the trimmed version via rule-deny-exact-space.
+    assert_eq!(
+        report.policy, "fail-closed-path-resolution",
+        "Untrimmed path must be rejected fail-closed at policy boundary, not matched to policy rule"
+    );
+    assert_ne!(
+        report.policy, "policy-whitespace-test",
+        "Request must NOT be silently matched against policy rule via trimmed path"
+    );
+    assert!(
+        !report.logs.contains("rule-deny-exact-space"),
+        "Must not match rule-deny-exact-space on trimmed path representation"
+    );
+    assert!(
+        report.logs.contains("Path resolution failed") && report.logs.contains("whitespace"),
+        "Logs must indicate boundary resolution failure due to whitespace"
+    );
+}

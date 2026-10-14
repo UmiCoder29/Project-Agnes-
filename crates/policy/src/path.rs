@@ -49,12 +49,17 @@ pub fn resolve_real_path(raw_path: &str) -> Result<PathBuf, Error> {
     if raw_path.contains('\0') {
         return Err(Error::new(ErrorKind::InvalidInput, "Null byte in path"));
     }
-    let trimmed = raw_path.trim();
-    if trimmed.is_empty() {
+    if raw_path.is_empty() {
         return Err(Error::new(ErrorKind::InvalidInput, "Empty path"));
     }
+    if raw_path.starts_with(char::is_whitespace) || raw_path.ends_with(char::is_whitespace) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Leading or trailing whitespace in path",
+        ));
+    }
 
-    resolve_real_path_bounded(Path::new(trimmed), 0)
+    resolve_real_path_bounded(Path::new(raw_path), 0)
 }
 
 
@@ -147,4 +152,53 @@ pub fn normalize_lexical_pathbuf(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rejects_trailing_whitespace() {
+        let err = resolve_real_path("/tmp/test_file.txt ").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "Leading or trailing whitespace in path");
+    }
+
+    #[test]
+    fn test_rejects_leading_whitespace() {
+        let err = resolve_real_path(" /tmp/test_file.txt").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "Leading or trailing whitespace in path");
+    }
+
+    #[test]
+    fn test_rejects_tab_and_newline_whitespace() {
+        let err_tab = resolve_real_path("\t/tmp/test_file.txt").unwrap_err();
+        assert_eq!(err_tab.kind(), ErrorKind::InvalidInput);
+
+        let err_nl = resolve_real_path("/tmp/test_file.txt\n").unwrap_err();
+        assert_eq!(err_nl.kind(), ErrorKind::InvalidInput);
+
+        let err_cr = resolve_real_path("/tmp/test_file.txt\r").unwrap_err();
+        assert_eq!(err_cr.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_rejects_empty_and_whitespace_only() {
+        let err_empty = resolve_real_path("").unwrap_err();
+        assert_eq!(err_empty.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err_empty.to_string(), "Empty path");
+
+        let err_ws = resolve_real_path("   ").unwrap_err();
+        assert_eq!(err_ws.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err_ws.to_string(), "Leading or trailing whitespace in path");
+    }
+
+    #[test]
+    fn test_rejects_null_byte() {
+        let err = resolve_real_path("/tmp/test\0file.txt").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "Null byte in path");
+    }
 }
