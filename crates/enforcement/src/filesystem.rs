@@ -59,6 +59,31 @@ impl FilesystemEnforcer {
 
     /// Enforces file read action according to the deterministic policy decision
     /// and Linux kernel-enforced confinement (openat2 with RESOLVE_BENEATH).
+    ///
+    /// # TOCTOU Confinement Guarantee & Limits
+    ///
+    /// **Guarantee**:
+    /// 1. Atomic Kernel Confinement: `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`
+    ///    executes resolution and opening in a single atomic syscall anchored to `dirfd`.
+    ///    The kernel VFS rejects any traversal ascending above `dirfd` or following an
+    ///    out-of-tree symlink with `EXDEV`.
+    /// 2. Post-Open Inode Identity Verification: Once `openat2` opens `file_fd`, the inode
+    ///    is pinned in kernel memory. Reading `/proc/self/fd/{file_fd}` verifies that the
+    ///    opened descriptor matches the exact canonical target approved by the policy engine
+    ///    (`decision_resp.resolved_resource`). Any intra-sandbox symlink swap occurring
+    ///    in the TOCTOU window between policy evaluation and `openat2` is detected and blocked
+    ///    fail-closed before reading file content.
+    /// 3. Inode Pinning: Subsequent renames, unlinks, or symlink swaps on disk cannot alter
+    ///    the data read from an already-opened descriptor.
+    ///
+    /// **Limits**:
+    /// 1. In-place content mutation: While path and inode substitution races are closed,
+    ///    concurrent in-place modifications to the opened file's content by an external process
+    ///    are governed by POSIX shared file semantics (unless advisory/mandatory locking is applied).
+    /// 2. Sandbox Root Trust: Confinement assumes the registered sandbox root directory itself
+    ///    is trusted and cannot be maliciously unmounted or replaced by an unprivileged agent.
+    /// 3. Platform Requirement: Native atomic confinement requires Linux 5.6+ `openat2` (syscall 437)
+    ///    and a valid `/proc/self/fd` mount.
     pub fn enforce_read(&self, request: &ActionRequest, decision_resp: &PolicyDecisionResponse) -> EnforcementResult {
         let raw_path = match &request.payload {
             ActionPayload::ReadFile { path } => path,
@@ -102,9 +127,24 @@ impl FilesystemEnforcer {
             };
         }
 
+        // The policy engine must have resolved and approved a real canonical resource.
+        let expected_resolved_target = match decision_resp.resolved_resource.as_deref() {
+            Some(res) => res,
+            None => {
+                warn!(target = %raw_path, "Policy allowed file read but resolved_resource is missing: fail-closed");
+                return EnforcementResult {
+                    enforcement_action: EnforcementAction::BlockRequest,
+                    observed_result: ObservedResult::BlockedByFirewall,
+                    output: None,
+                    error_message: Some("Fail-closed: Missing resolved resource for policy verification".to_string()),
+                };
+            }
+        };
+
         // Find enclosing sandbox root
         let target_path = Path::new(raw_path);
-        let matching_root = self.find_sandbox_root(target_path, &decision_resp.matched_policy_id);
+        let expected_path = Path::new(expected_resolved_target);
+        let matching_root = self.find_sandbox_root(target_path, Some(expected_path), &decision_resp.matched_policy_id);
 
         let root_dir = match matching_root {
             Some(r) => r,
@@ -123,11 +163,11 @@ impl FilesystemEnforcer {
             }
         };
 
-        // Enforce kernel resolution beneath root_dir
-        self.enforce_kernel_confined_read(&root_dir, target_path, raw_path)
+        // Enforce kernel resolution beneath root_dir with atomic post-open identity verification
+        self.enforce_kernel_confined_read(&root_dir, target_path, raw_path, expected_resolved_target)
     }
 
-    fn find_sandbox_root(&self, target_path: &Path, _policy_id: &str) -> Option<PathBuf> {
+    fn find_sandbox_root(&self, target_path: &Path, expected_path: Option<&Path>, _policy_id: &str) -> Option<PathBuf> {
         let roots = self.sandbox_roots.read().expect("lock poisoned");
 
         // Try to find the best matching root
@@ -142,6 +182,15 @@ impl FilesystemEnforcer {
         for root in roots.iter() {
             if normalized.starts_with(root) {
                 return Some(root.clone());
+            }
+        }
+
+        // Try matching root from expected_path (the resolved canonical path approved by policy)
+        if let Some(exp) = expected_path {
+            for root in roots.iter() {
+                if exp.starts_with(root) {
+                    return Some(root.clone());
+                }
             }
         }
 
@@ -174,8 +223,15 @@ impl FilesystemEnforcer {
         out
     }
 
-    /// Uses Linux openat2 with RESOLVE_BENEATH to atomically confine open to root_dir.
-    fn enforce_kernel_confined_read(&self, root_dir: &Path, target_path: &Path, raw_path: &str) -> EnforcementResult {
+    /// Uses Linux openat2 with RESOLVE_BENEATH to atomically confine open to root_dir,
+    /// followed by post-open descriptor verification against the policy-approved target.
+    fn enforce_kernel_confined_read(
+        &self,
+        root_dir: &Path,
+        target_path: &Path,
+        raw_path: &str,
+        expected_resolved_target: &str,
+    ) -> EnforcementResult {
         let root_c_str = match CString::new(root_dir.to_str().unwrap_or_default()) {
             Ok(s) => s,
             Err(_) => {
@@ -188,11 +244,11 @@ impl FilesystemEnforcer {
             }
         };
 
-        // Open directory file descriptor for the root with O_PATH | O_DIRECTORY
+        // Open directory file descriptor for the root with O_PATH | O_DIRECTORY | O_NOFOLLOW
         let dirfd: RawFd = unsafe {
             libc::open(
                 root_c_str.as_ptr(),
-                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             )
         };
 
@@ -294,7 +350,56 @@ impl FilesystemEnforcer {
             }
         }
 
-        // Successfully opened file descriptor guaranteed by kernel to be beneath root_dir!
+        // Post-Open Inode Identity Verification:
+        // Ensure that the file descriptor opened by the kernel corresponds exactly to the
+        // canonical resource authorized by the policy engine. If an intra-sandbox symlink was
+        // swapped between policy evaluation and openat2, opened_path will diverge from expected_path.
+        let opened_path = match fs::read_link(format!("/proc/self/fd/{}", file_fd)) {
+            Ok(p) => p,
+            Err(e) => {
+                unsafe { libc::close(file_fd); }
+                warn!(error = %e, "Failed to verify opened file descriptor target via /proc/self/fd");
+                return EnforcementResult {
+                    enforcement_action: EnforcementAction::BlockRequest,
+                    observed_result: ObservedResult::BlockedByFirewall,
+                    output: None,
+                    error_message: Some(format!("Failed to verify opened file descriptor target: {}", e)),
+                };
+            }
+        };
+
+        let expected_path = Path::new(expected_resolved_target);
+        let paths_match = if opened_path == expected_path {
+            true
+        } else {
+            // Also compare canonicalized representations in case of mount aliases or symlink normalization
+            match (opened_path.canonicalize(), expected_path.canonicalize()) {
+                (Ok(op), Ok(ep)) => op == ep,
+                _ => false,
+            }
+        };
+
+        if !paths_match {
+            unsafe { libc::close(file_fd); }
+            warn!(
+                expected = %expected_path.display(),
+                opened = %opened_path.display(),
+                "TOCTOU VIOLATION: File opened by kernel does not match policy-approved resource"
+            );
+            return EnforcementResult {
+                enforcement_action: EnforcementAction::CanonicalBoundaryViolation,
+                observed_result: ObservedResult::BlockedByFirewall,
+                output: None,
+                error_message: Some(format!(
+                    "TOCTOU violation detected: opened path '{}' does not match authorized path '{}'",
+                    opened_path.display(),
+                    expected_path.display()
+                )),
+            };
+        }
+
+        // Successfully opened file descriptor guaranteed by kernel to be beneath root_dir
+        // and verified to match the authorized policy target.
         let mut file = unsafe { fs::File::from_raw_fd(file_fd) };
         let mut content = String::new();
         match file.read_to_string(&mut content) {
@@ -313,3 +418,4 @@ impl FilesystemEnforcer {
         }
     }
 }
+

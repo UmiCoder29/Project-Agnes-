@@ -735,4 +735,153 @@ fn test_regression_017_target_resolution_atomic_against_mid_evaluation_change() 
     );
 }
 
+// REGRESSION-018: TOCTOU race where an intra-sandbox symlink is swapped
+// between policy evaluation and kernel file open.
+// Both allowed_doc and internal_secret reside within the allowed sandbox root.
+// Policy explicitly allows access to allowed_doc and denies internal_secret.
+// Request targets swappable_link, which points to allowed_doc at evaluation time (Decision::Allow).
+// Attacker replaces swappable_link with a symlink to internal_secret before enforcement runs.
+// Without atomic descriptor-target verification, openat2(RESOLVE_BENEATH) succeeds because
+// internal_secret is within the sandbox root, leaking secret data despite policy denial.
+#[test]
+fn test_regression_018_toctou_symlink_swap_between_policy_and_enforcement() {
+    let temp = tempdir().expect("tempdir failed");
+    let allowed_dir = temp.path().join("allowed_sandbox");
+    fs::create_dir_all(&allowed_dir).expect("mkdir allowed_sandbox");
+
+    let canonical_root = allowed_dir.canonicalize().expect("canonicalize root");
+
+    let allowed_file = canonical_root.join("public_doc.txt");
+    fs::write(&allowed_file, "SAFE_PUBLIC_DATA_018").expect("write public file");
+
+    let secret_file = canonical_root.join("internal_secret.txt");
+    fs::write(&secret_file, "CLASSIFIED_SECRET_018").expect("write secret file");
+
+    let swappable_link = canonical_root.join("swappable_link.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("public_doc.txt", &swappable_link).expect("create symlink");
+
+    let harness = SecurityTestHarness::new();
+    harness.fs_enforcer.register_sandbox_root(&canonical_root);
+
+    let allowed_str = allowed_file.to_str().unwrap().to_string();
+    let secret_str = secret_file.to_str().unwrap().to_string();
+
+    let policy = Policy::new("policy-toctou-gap", "TOCTOU Intra-Sandbox Test Policy", 1)
+        .with_rule(PolicyRule {
+            id: "rule-allow-public".to_string(),
+            description: "Allow reading public doc only".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: allowed_str.clone(),
+            priority: 10,
+        })
+        .with_rule(PolicyRule {
+            id: "rule-deny-secret".to_string(),
+            description: "Deny reading internal secret".to_string(),
+            decision: Decision::Deny,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: secret_str.clone(),
+            priority: 20,
+        });
+
+    harness.policy_engine.add_policy(policy);
+
+    let req = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: swappable_link.to_str().unwrap().to_string(),
+        },
+    ).with_test_id("REGRESSION-018-TOCTOU");
+
+    // 1. Time of Check: PolicyEngine evaluates swappable_link pointing to allowed_file -> Decision::Allow
+    let decision = harness.policy_engine.evaluate(&req);
+    assert_eq!(decision.decision, Decision::Allow);
+    assert_eq!(
+        decision.resolved_resource.as_deref(),
+        Some(allowed_str.as_str()),
+        "Policy engine must have approved the resolved public file path"
+    );
+
+    // 2. TOCTOU Window: Attacker swaps swappable_link to point to internal_secret (relative symlink)
+    fs::remove_file(&swappable_link).expect("remove symlink");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("internal_secret.txt", &swappable_link).expect("swap symlink to secret");
+
+    // 3. Time of Use: Enforcement runs on swappable_link
+    let enforcement_res = harness.fs_enforcer.enforce_read(&req, &decision);
+
+    // MUST FAIL-CLOSED AND NOT LEAK THE SECRET!
+    assert_ne!(
+        enforcement_res.observed_result,
+        ObservedResult::AccessSuccess,
+        "CRITICAL TOCTOU FAILURE: Enforcement permitted access after symlink was swapped to unauthorized file!"
+    );
+    assert_eq!(
+        enforcement_res.observed_result,
+        ObservedResult::BlockedByFirewall,
+        "Enforcement must block the request when opened file does not match approved policy resource"
+    );
+    assert_eq!(
+        enforcement_res.output,
+        None,
+        "Must never leak file content when a TOCTOU race condition is detected"
+    );
+}
+
+// Non-race companion test: When no symlink swap occurs, the benign request succeeds
+// cleanly through openat2 and post-open descriptor verification.
+#[test]
+fn test_regression_018_non_race_path_succeeds() {
+    let temp = tempdir().expect("tempdir failed");
+    let allowed_dir = temp.path().join("allowed_sandbox");
+    fs::create_dir_all(&allowed_dir).expect("mkdir allowed_sandbox");
+
+    let canonical_root = allowed_dir.canonicalize().expect("canonicalize root");
+
+    let allowed_file = canonical_root.join("public_doc.txt");
+    fs::write(&allowed_file, "SAFE_PUBLIC_DATA_018").expect("write public file");
+
+    let swappable_link = canonical_root.join("swappable_link.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("public_doc.txt", &swappable_link).expect("create symlink");
+
+    let harness = SecurityTestHarness::new();
+    harness.fs_enforcer.register_sandbox_root(&canonical_root);
+
+    let allowed_str = allowed_file.to_str().unwrap().to_string();
+
+    let policy = Policy::new("policy-benign", "Benign Policy", 1)
+        .with_rule(PolicyRule {
+            id: "rule-allow-public".to_string(),
+            description: "Allow reading public doc".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: allowed_str.clone(),
+            priority: 10,
+        });
+
+    harness.policy_engine.add_policy(policy);
+
+    let req = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: swappable_link.to_str().unwrap().to_string(),
+        },
+    ).with_test_id("REGRESSION-018-BENIGN");
+
+    let decision = harness.policy_engine.evaluate(&req);
+    assert_eq!(decision.decision, Decision::Allow);
+
+    let enforcement_res = harness.fs_enforcer.enforce_read(&req, &decision);
+    assert_eq!(enforcement_res.observed_result, ObservedResult::AccessSuccess);
+    assert_eq!(enforcement_res.enforcement_action, EnforcementAction::PermitExecution);
+    assert_eq!(enforcement_res.output, Some("SAFE_PUBLIC_DATA_018".to_string()));
+}
+
+
+
 
