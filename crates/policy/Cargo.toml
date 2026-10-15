@@ -5,6 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+test-hooks = []
+
 [dependencies]
 agnes-common = { path = "../common" }
 serde.workspace = true

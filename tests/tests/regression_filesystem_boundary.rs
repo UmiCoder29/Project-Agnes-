@@ -634,31 +634,41 @@ fn test_regression_017_single_path_resolution_per_request() {
     );
 }
 
-// REGRESSION-017-B: A symlink whose target is deleted after the initial resolution
-// in PolicyEngine::evaluate() must still evaluate correctly because matches_target()
-// evaluates the already-resolved path string rather than re-resolving from the filesystem.
+// REGRESSION-017-B: Atomic resolution must evaluate against the path resolved at the
+// policy boundary without picking up mid-evaluation filesystem modifications.
+// If a symlink pointing to an allowed file is repointed mid-evaluation to a denied path,
+// the policy decision must remain Allow (the decision of the first resolution) rather than
+// re-resolving from disk and matching Deny.
 #[test]
 fn test_regression_017_target_resolution_atomic_against_mid_evaluation_change() {
     let temp = tempdir().expect("tempdir failed");
     let allowed_dir = temp.path().join("allowed");
+    let denied_dir = temp.path().join("denied");
     fs::create_dir_all(&allowed_dir).expect("mkdir allowed");
+    fs::create_dir_all(&denied_dir).expect("mkdir denied");
 
-    let canonical_allowed_dir = allowed_dir.canonicalize().expect("canonicalize allowed_dir");
+    let canonical_allowed_dir = allowed_dir.canonicalize().expect("canonicalize allowed");
+    let canonical_denied_dir = denied_dir.canonicalize().expect("canonicalize denied");
 
-    let real_file = canonical_allowed_dir.join("ephemeral_real.txt");
-    fs::write(&real_file, "EPHEMERAL_DATA_017").expect("write real file");
+    let allowed_target = canonical_allowed_dir.join("allowed_file.txt");
+    fs::write(&allowed_target, "SAFE_CANARY_017").expect("write allowed file");
 
-    let symlink_path = canonical_allowed_dir.join("ephemeral_link.txt");
+    let denied_target = canonical_denied_dir.join("denied_file.txt");
+    fs::write(&denied_target, "RESTRICTED_CANARY_017").expect("write denied file");
+
+    // Initially, symlink inside allowed_dir points to allowed_target (in allowed_dir)
+    let symlink_path = canonical_allowed_dir.join("swappable_link.txt");
     #[cfg(unix)]
-    std::os::unix::fs::symlink(&real_file, &symlink_path).expect("create symlink");
+    std::os::unix::fs::symlink(&allowed_target, &symlink_path).expect("create initial symlink");
 
     let harness = SecurityTestHarness::new();
     harness.fs_enforcer.register_sandbox_root(&canonical_allowed_dir);
 
-    let policy = Policy::new("policy-atomic-res", "Atomic Resolution Policy", 1)
+    // Policy allows access only to allowed_dir/*; anything else fails closed (Deny).
+    let policy = Policy::new("policy-atomic-swap", "Atomic Resolution Mid-Evaluation Swap Test", 1)
         .with_rule(PolicyRule {
-            id: "rule-allow-sandbox".to_string(),
-            description: "Allow reading sandbox files".to_string(),
+            id: "rule-allow-sandbox-dir".to_string(),
+            description: "Allow reading inside allowed_dir".to_string(),
             decision: Decision::Allow,
             agent_pattern: "agent-001".to_string(),
             action_types: vec![ActionType::ReadFile],
@@ -668,12 +678,27 @@ fn test_regression_017_target_resolution_atomic_against_mid_evaluation_change() 
 
     harness.policy_engine.add_policy(policy);
 
-    let real_file_clone = real_file.clone();
-    // After the first resolution (in PolicyEngine::evaluate), delete real_file.
-    // If matches_target() re-resolves the target from disk, it will fail (NotFound -> Deny).
-    // If resolution occurs only once and the resolved string is passed down, evaluate() returns Allow.
+    let symlink_path_clone = symlink_path.clone();
+    let allowed_target_clone = allowed_target.clone();
+    let denied_target_clone = denied_target.clone();
+
+    // Reset resolution counter before request
+    agnes_policy::reset_resolution_count();
+
+    // Hook fires immediately after the first resolve_real_path completes (in PolicyEngine::evaluate)
+    // and repoints both symlink_path and allowed_target to point to denied_target.
+    // If matches_target() re-resolves either the symlink or the target from disk, it will resolve
+    // to denied_target and fail to match rule-allow-sandbox-dir, defaulting to Decision::Deny.
+    // Because resolution happens exactly once, evaluate() uses the first resolved path (allowed_target)
+    // and evaluates to Decision::Allow (rule-allow-sandbox-dir).
     agnes_policy::set_resolution_hook(move |_resolved_raw| {
-        let _ = fs::remove_file(&real_file_clone);
+        let _ = fs::remove_file(&symlink_path_clone);
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink(&denied_target_clone, &symlink_path_clone);
+
+        let _ = fs::remove_file(&allowed_target_clone);
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink(&denied_target_clone, &allowed_target_clone);
     });
 
     let req = ActionRequest::new(
@@ -681,15 +706,33 @@ fn test_regression_017_target_resolution_atomic_against_mid_evaluation_change() 
         ActionPayload::ReadFile {
             path: symlink_path.to_str().unwrap().to_string(),
         },
-    ).with_test_id("REGRESSION-017-ATOMIC");
+    ).with_test_id("REGRESSION-017-SWAP");
 
     let decision = harness.policy_engine.evaluate(&req);
     agnes_policy::clear_resolution_hook();
 
+    let count = agnes_policy::resolution_count();
+
     assert_eq!(
         decision.decision,
         Decision::Allow,
-        "Policy evaluation must succeed atomically using the single resolved path without re-resolving"
+        "Policy evaluation must succeed atomically using the single resolved path without re-resolving from disk"
+    );
+    assert_eq!(
+        decision.matched_policy_id,
+        "policy-atomic-swap",
+        "Must match the allowed policy"
+    );
+    assert_eq!(
+        decision.reason.rule_id.as_deref(),
+        Some("rule-allow-sandbox-dir"),
+        "Must match rule-allow-sandbox-dir from initial resolution rather than picking up swapped denied target"
+    );
+    assert_eq!(
+        count, 1,
+        "Path resolution must happen exactly once, but occurred {} times",
+        count
     );
 }
+
 

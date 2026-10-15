@@ -39,37 +39,47 @@ pub fn resolve_request_target(request: &ActionRequest) -> Result<Option<PathBuf>
     }
 }
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::RwLock;
+#[cfg(feature = "test-hooks")]
+use std::cell::{Cell, RefCell};
 
-static RESOLUTION_COUNT: AtomicUsize = AtomicUsize::new(0);
-
+#[cfg(feature = "test-hooks")]
 type ResolutionHook = Box<dyn Fn(&str) + Send + Sync>;
-static RESOLUTION_HOOK: RwLock<Option<ResolutionHook>> = RwLock::new(None);
 
-/// Returns the number of times `resolve_real_path` has been called.
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    static RESOLUTION_COUNT: Cell<usize> = const { Cell::new(0) };
+    static RESOLUTION_HOOK: RefCell<Option<ResolutionHook>> = const { RefCell::new(None) };
+}
+
+#[cfg(feature = "test-hooks")]
+/// Returns the number of times `resolve_real_path` has been called on the current thread.
 pub fn resolution_count() -> usize {
-    RESOLUTION_COUNT.load(Ordering::SeqCst)
+    RESOLUTION_COUNT.with(|c| c.get())
 }
 
-/// Resets the resolution counter.
+#[cfg(feature = "test-hooks")]
+/// Resets the resolution counter on the current thread.
 pub fn reset_resolution_count() {
-    RESOLUTION_COUNT.store(0, Ordering::SeqCst);
+    RESOLUTION_COUNT.with(|c| c.set(0));
 }
 
-/// Sets an optional hook to run after a path is successfully resolved by `resolve_real_path`.
+#[cfg(feature = "test-hooks")]
+/// Sets an optional hook to run on the current thread after a path is successfully resolved by `resolve_real_path`.
 pub fn set_resolution_hook<F>(hook: F)
 where
     F: Fn(&str) + Send + Sync + 'static,
 {
-    let mut guard = RESOLUTION_HOOK.write().expect("lock poisoned");
-    *guard = Some(Box::new(hook));
+    RESOLUTION_HOOK.with(|h| {
+        *h.borrow_mut() = Some(Box::new(hook));
+    });
 }
 
-/// Clears any configured resolution hook.
+#[cfg(feature = "test-hooks")]
+/// Clears any configured resolution hook on the current thread.
 pub fn clear_resolution_hook() {
-    let mut guard = RESOLUTION_HOOK.write().expect("lock poisoned");
-    *guard = None;
+    RESOLUTION_HOOK.with(|h| {
+        *h.borrow_mut() = None;
+    });
 }
 
 /// Resolves a path to its real, final canonical path on the filesystem,
@@ -79,7 +89,8 @@ pub fn clear_resolution_hook() {
 /// Fail-closed: If the path contains null bytes, exceeds symlink recursion limit,
 /// or cannot be unambiguously resolved, an error is returned.
 pub fn resolve_real_path(raw_path: &str) -> Result<PathBuf, Error> {
-    RESOLUTION_COUNT.fetch_add(1, Ordering::SeqCst);
+    #[cfg(feature = "test-hooks")]
+    RESOLUTION_COUNT.with(|c| c.set(c.get() + 1));
 
     if raw_path.contains('\0') {
         return Err(Error::new(ErrorKind::InvalidInput, "Null byte in path"));
@@ -96,11 +107,12 @@ pub fn resolve_real_path(raw_path: &str) -> Result<PathBuf, Error> {
 
     let resolved = resolve_real_path_bounded(Path::new(raw_path), 0)?;
 
-    if let Ok(guard) = RESOLUTION_HOOK.read() {
-        if let Some(hook) = guard.as_ref() {
+    #[cfg(feature = "test-hooks")]
+    RESOLUTION_HOOK.with(|h| {
+        if let Some(hook) = h.borrow().as_ref() {
             hook(raw_path);
         }
-    }
+    });
 
     Ok(resolved)
 }
