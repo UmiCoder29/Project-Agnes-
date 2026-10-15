@@ -39,6 +39,39 @@ pub fn resolve_request_target(request: &ActionRequest) -> Result<Option<PathBuf>
     }
 }
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::RwLock;
+
+static RESOLUTION_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+type ResolutionHook = Box<dyn Fn(&str) + Send + Sync>;
+static RESOLUTION_HOOK: RwLock<Option<ResolutionHook>> = RwLock::new(None);
+
+/// Returns the number of times `resolve_real_path` has been called.
+pub fn resolution_count() -> usize {
+    RESOLUTION_COUNT.load(Ordering::SeqCst)
+}
+
+/// Resets the resolution counter.
+pub fn reset_resolution_count() {
+    RESOLUTION_COUNT.store(0, Ordering::SeqCst);
+}
+
+/// Sets an optional hook to run after a path is successfully resolved by `resolve_real_path`.
+pub fn set_resolution_hook<F>(hook: F)
+where
+    F: Fn(&str) + Send + Sync + 'static,
+{
+    let mut guard = RESOLUTION_HOOK.write().expect("lock poisoned");
+    *guard = Some(Box::new(hook));
+}
+
+/// Clears any configured resolution hook.
+pub fn clear_resolution_hook() {
+    let mut guard = RESOLUTION_HOOK.write().expect("lock poisoned");
+    *guard = None;
+}
+
 /// Resolves a path to its real, final canonical path on the filesystem,
 /// following all symbolic links, stripping redundant separators, and
 /// resolving all '.' and '..' components.
@@ -46,6 +79,8 @@ pub fn resolve_request_target(request: &ActionRequest) -> Result<Option<PathBuf>
 /// Fail-closed: If the path contains null bytes, exceeds symlink recursion limit,
 /// or cannot be unambiguously resolved, an error is returned.
 pub fn resolve_real_path(raw_path: &str) -> Result<PathBuf, Error> {
+    RESOLUTION_COUNT.fetch_add(1, Ordering::SeqCst);
+
     if raw_path.contains('\0') {
         return Err(Error::new(ErrorKind::InvalidInput, "Null byte in path"));
     }
@@ -59,7 +94,15 @@ pub fn resolve_real_path(raw_path: &str) -> Result<PathBuf, Error> {
         ));
     }
 
-    resolve_real_path_bounded(Path::new(raw_path), 0)
+    let resolved = resolve_real_path_bounded(Path::new(raw_path), 0)?;
+
+    if let Ok(guard) = RESOLUTION_HOOK.read() {
+        if let Some(hook) = guard.as_ref() {
+            hook(raw_path);
+        }
+    }
+
+    Ok(resolved)
 }
 
 

@@ -552,3 +552,144 @@ fn test_regression_016_whitespace_trimming_mismatch() {
         "Logs must indicate boundary resolution failure due to whitespace"
     );
 }
+
+// REGRESSION-017: Filesystem path must be resolved exactly once per evaluate() call.
+// Duplicate path resolution in matches_target() introduces redundant filesystem I/O
+// and TOCTOU risks during evaluation.
+#[test]
+fn test_regression_017_single_path_resolution_per_request() {
+    let temp = tempdir().expect("tempdir failed");
+    let allowed_dir = temp.path().join("allowed");
+    fs::create_dir_all(&allowed_dir).expect("mkdir allowed");
+
+    let canonical_allowed_dir = allowed_dir.canonicalize().expect("canonicalize allowed_dir");
+
+    let target_file = canonical_allowed_dir.join("single_res_file.txt");
+    fs::write(&target_file, "TEST_DATA_SINGLE_RESOLUTION").expect("write test file");
+
+    let target_file_str = target_file.to_str().unwrap().to_string();
+
+    let harness = SecurityTestHarness::new();
+    harness.fs_enforcer.register_sandbox_root(&canonical_allowed_dir);
+
+    // Policy with 3 rules matching the agent and action type.
+    // If redundant resolution occurs in matches_target(), each rule will trigger
+    // an additional call to resolve_real_path().
+    let policy = Policy::new("policy-single-resolution", "Single Resolution Verification Policy", 1)
+        .with_rule(PolicyRule {
+            id: "rule-allow-dir-prefix".to_string(),
+            description: "Allow reading inside allowed sandbox dir".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/*", canonical_allowed_dir.display()),
+            priority: 10,
+        })
+        .with_rule(PolicyRule {
+            id: "rule-allow-exact-file".to_string(),
+            description: "Allow reading target file by exact path".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: target_file_str.clone(),
+            priority: 20,
+        })
+        .with_rule(PolicyRule {
+            id: "rule-allow-wildcard-fallback".to_string(),
+            description: "Wildcard rule matching agent and action type".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "*".to_string(),
+            priority: 5,
+        });
+
+    harness.policy_engine.add_policy(policy);
+
+    let req = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: target_file_str.clone(),
+        },
+    ).with_test_id("REGRESSION-017");
+
+    // Reset resolution counter before calling evaluate
+    agnes_policy::reset_resolution_count();
+
+    let report = harness.execute_request(req);
+
+    let count = agnes_policy::resolution_count();
+
+    // The request should be evaluated and permitted
+    assert_ne!(report.observed_result, ObservedResult::Error);
+    assert_eq!(report.decision, Decision::Allow);
+
+    // CRITICAL REGRESSION ASSERTION:
+    // Path resolution for the target resource must occur EXACTLY ONCE per request.
+    // Without the fix, matches_target() re-resolves the target for every matching rule (count >= 4).
+    assert_eq!(
+        count, 1,
+        "Path resolution must happen exactly once per evaluate() call, but occurred {} times",
+        count
+    );
+}
+
+// REGRESSION-017-B: A symlink whose target is deleted after the initial resolution
+// in PolicyEngine::evaluate() must still evaluate correctly because matches_target()
+// evaluates the already-resolved path string rather than re-resolving from the filesystem.
+#[test]
+fn test_regression_017_target_resolution_atomic_against_mid_evaluation_change() {
+    let temp = tempdir().expect("tempdir failed");
+    let allowed_dir = temp.path().join("allowed");
+    fs::create_dir_all(&allowed_dir).expect("mkdir allowed");
+
+    let canonical_allowed_dir = allowed_dir.canonicalize().expect("canonicalize allowed_dir");
+
+    let real_file = canonical_allowed_dir.join("ephemeral_real.txt");
+    fs::write(&real_file, "EPHEMERAL_DATA_017").expect("write real file");
+
+    let symlink_path = canonical_allowed_dir.join("ephemeral_link.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real_file, &symlink_path).expect("create symlink");
+
+    let harness = SecurityTestHarness::new();
+    harness.fs_enforcer.register_sandbox_root(&canonical_allowed_dir);
+
+    let policy = Policy::new("policy-atomic-res", "Atomic Resolution Policy", 1)
+        .with_rule(PolicyRule {
+            id: "rule-allow-sandbox".to_string(),
+            description: "Allow reading sandbox files".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/*", canonical_allowed_dir.display()),
+            priority: 10,
+        });
+
+    harness.policy_engine.add_policy(policy);
+
+    let real_file_clone = real_file.clone();
+    // After the first resolution (in PolicyEngine::evaluate), delete real_file.
+    // If matches_target() re-resolves the target from disk, it will fail (NotFound -> Deny).
+    // If resolution occurs only once and the resolved string is passed down, evaluate() returns Allow.
+    agnes_policy::set_resolution_hook(move |_resolved_raw| {
+        let _ = fs::remove_file(&real_file_clone);
+    });
+
+    let req = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: symlink_path.to_str().unwrap().to_string(),
+        },
+    ).with_test_id("REGRESSION-017-ATOMIC");
+
+    let decision = harness.policy_engine.evaluate(&req);
+    agnes_policy::clear_resolution_hook();
+
+    assert_eq!(
+        decision.decision,
+        Decision::Allow,
+        "Policy evaluation must succeed atomically using the single resolved path without re-resolving"
+    );
+}
+

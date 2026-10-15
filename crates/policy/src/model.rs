@@ -16,7 +16,7 @@ pub struct PolicyRule {
     pub priority: i32,
 }
 
-use crate::path::{is_path_resource, resolve_real_path, resolve_request_target};
+use crate::path::{resolve_real_path, resolve_request_target};
 
 impl PolicyRule {
     pub fn matches(&self, request: &ActionRequest) -> bool {
@@ -48,18 +48,8 @@ impl PolicyRule {
             return false;
         }
 
-        // 3. Confirm target is fully resolved if this is a path-bearing action
-        let final_target = if is_path_resource(request.action_type, target) {
-            match resolve_real_path(target) {
-                Ok(path) => path.to_string_lossy().to_string(),
-                Err(_) => return false, // Fail-closed: unresolvable or ambiguous path
-            }
-        } else {
-            target.to_string()
-        };
-
-        // 4. Resource pattern match
-        self.matches_resource(&final_target)
+        // 3. Resource pattern match (target is already resolved exactly once by PolicyEngine::evaluate)
+        self.matches_resource(target)
     }
 
     pub fn matches_resource(&self, target: &str) -> bool {
