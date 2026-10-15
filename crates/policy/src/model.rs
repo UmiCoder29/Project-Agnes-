@@ -121,4 +121,11 @@ impl Policy {
         self.rules.push(rule);
         self
     }
+
+    /// Parses a Policy from a JSON configuration string.
+    /// Fails safely if the JSON is malformed, missing required fields, or has invalid types.
+    pub fn from_json(json_str: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json_str)
+    }
 }
+

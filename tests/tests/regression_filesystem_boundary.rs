@@ -982,6 +982,103 @@ fn test_regression_019_approved_file_replaced_by_symlink() {
     );
 }
 
+// REGRESSION-020: Zero matching rules resolves to Deny (fail-closed default).
+#[test]
+fn test_regression_020_zero_matching_rules_resolves_to_deny() {
+    let harness = SecurityTestHarness::new();
+    let policy = Policy::new("policy-agent-002", "Agent 002 Only", 1).with_rule(PolicyRule {
+        id: "rule-agent-002-only".to_string(),
+        description: "Allow only agent-002".to_string(),
+        decision: Decision::Allow,
+        agent_pattern: "agent-002".to_string(),
+        action_types: vec![ActionType::ReadFile],
+        resource_pattern: "/sandbox/*".to_string(),
+        priority: 10,
+    });
+    harness.policy_engine.add_policy(policy);
+
+    let req = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: "/sandbox/file.txt".to_string(),
+        },
+    ).with_test_id("REGRESSION-020-ZERO-RULES");
+
+    let report = harness.execute_request(req);
+    assert_eq!(report.decision, Decision::Deny);
+    assert_eq!(report.policy, "default-fail-closed");
+    assert_eq!(report.enforcement, EnforcementAction::BlockRequest);
+    assert_eq!(report.observed_result, ObservedResult::BlockedByFirewall);
+}
+
+// REGRESSION-021: Policy configuration parsing failure at startup fails safely (safe startup failure).
+#[test]
+fn test_regression_021_policy_config_parsing_failure_safe_startup() {
+    // Malformed JSON must fail to parse safely
+    let malformed_json = r#"{"id": "bad", "name": "broken", rules: [INVALID]}"#;
+    let res = Policy::from_json(malformed_json);
+    assert!(res.is_err(), "Malformed policy JSON must fail parsing safely");
+
+    // Attempting to load malformed JSON into the engine must return Err
+    let harness = SecurityTestHarness::new();
+    let load_res = harness.policy_engine.load_policy_from_json(malformed_json);
+    assert!(load_res.is_err(), "Engine must reject malformed policy config at startup");
+
+    // Any request to an unpopulated or failed engine must fail closed to Deny
+    let req = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: "/sandbox/canary.txt".to_string(),
+        },
+    ).with_test_id("REGRESSION-021-PARSE-FAIL");
+
+    let report = harness.execute_request(req);
+    assert_eq!(report.decision, Decision::Deny);
+    assert_eq!(report.enforcement, EnforcementAction::BlockRequest);
+    assert_eq!(report.observed_result, ObservedResult::BlockedByFirewall);
+}
+
+// REGRESSION-022: Policy evaluation function panic or internal error fails closed to Deny.
+#[test]
+fn test_regression_022_evaluation_panic_fails_closed_to_deny() {
+    let harness = SecurityTestHarness::new();
+    let policy = Policy::new("policy-allow-all", "Allow All", 1).with_rule(PolicyRule {
+        id: "rule-allow".to_string(),
+        description: "Allow all".to_string(),
+        decision: Decision::Allow,
+        agent_pattern: "*".to_string(),
+        action_types: vec![ActionType::ReadFile],
+        resource_pattern: "*".to_string(),
+        priority: 10,
+    });
+    harness.policy_engine.add_policy(policy);
+
+    let req = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: "/sandbox/panic_test.txt".to_string(),
+        },
+    ).with_test_id("REGRESSION-022-PANIC");
+
+    // Simulate internal evaluation panic via resolution hook
+    agnes_policy::set_resolution_hook(|_| {
+        panic!("FATAL_SIMULATED_INTERNAL_EVALUATION_PANIC");
+    });
+
+    let report = harness.execute_request(req);
+    agnes_policy::clear_resolution_hook();
+
+    assert_eq!(
+        report.decision,
+        Decision::Deny,
+        "Evaluation panic must be caught and fail closed to Deny"
+    );
+    assert_eq!(report.policy, "fail-closed-evaluation-panic");
+    assert_eq!(report.enforcement, EnforcementAction::BlockRequest);
+    assert_eq!(report.observed_result, ObservedResult::BlockedByFirewall);
+}
+
+
 
 
 
