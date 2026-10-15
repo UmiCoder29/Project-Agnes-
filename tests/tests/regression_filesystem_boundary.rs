@@ -882,6 +882,107 @@ fn test_regression_018_non_race_path_succeeds() {
     assert_eq!(enforcement_res.output, Some("SAFE_PUBLIC_DATA_018".to_string()));
 }
 
+// REGRESSION-019: Target file itself replaced by symlink to unauthorized file after policy evaluation.
+// Policy allows public_doc.txt and denies internal_secret.txt, both in the sandbox.
+// Request targets a symlink to public_doc.txt.
+// After evaluation, attacker replaces public_doc.txt itself with a symlink to internal_secret.txt.
+// In the pre-fix code with canonicalize-based fallback, expected_path.canonicalize() re-resolves
+// public_doc.txt from disk at enforcement time, matching opened_path.canonicalize(), leaking the secret.
+// Under strict path-equality enforcement without disk re-resolution fallback, enforcement blocks the request.
+#[test]
+fn test_regression_019_approved_file_replaced_by_symlink() {
+    let temp = tempdir().expect("tempdir failed");
+    let allowed_dir = temp.path().join("allowed_sandbox");
+    fs::create_dir_all(&allowed_dir).expect("mkdir allowed_sandbox");
+
+    let canonical_root = allowed_dir.canonicalize().expect("canonicalize root");
+
+    let allowed_file = canonical_root.join("public_doc.txt");
+    fs::write(&allowed_file, "SAFE_PUBLIC_DATA_019").expect("write public file");
+
+    let secret_file = canonical_root.join("internal_secret.txt");
+    fs::write(&secret_file, "CLASSIFIED_SECRET_019").expect("write secret file");
+
+    let swappable_link = canonical_root.join("swappable_link.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("public_doc.txt", &swappable_link).expect("create symlink");
+
+    let harness = SecurityTestHarness::new();
+    harness.fs_enforcer.register_sandbox_root(&canonical_root);
+
+    let allowed_str = allowed_file.to_str().unwrap().to_string();
+    let secret_str = secret_file.to_str().unwrap().to_string();
+
+    let policy = Policy::new("policy-reg-019", "REGRESSION-019 Policy", 1)
+        .with_rule(PolicyRule {
+            id: "rule-allow-public".to_string(),
+            description: "Allow reading public doc".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: allowed_str.clone(),
+            priority: 10,
+        })
+        .with_rule(PolicyRule {
+            id: "rule-deny-secret".to_string(),
+            description: "Deny reading internal secret".to_string(),
+            decision: Decision::Deny,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: secret_str.clone(),
+            priority: 20,
+        });
+
+    harness.policy_engine.add_policy(policy);
+
+    let req = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: swappable_link.to_str().unwrap().to_string(),
+        },
+    ).with_test_id("REGRESSION-019-TARGET-SWAP");
+
+    // 1. Policy evaluation approves access to public_doc.txt
+    let decision = harness.policy_engine.evaluate(&req);
+    assert_eq!(decision.decision, Decision::Allow);
+    assert_eq!(
+        decision.resolved_resource.as_deref(),
+        Some(allowed_str.as_str()),
+        "Policy engine must have approved public_doc.txt"
+    );
+
+    // 2. TOCTOU: Attacker replaces public_doc.txt itself with a symlink to internal_secret.txt
+    fs::remove_file(&allowed_file).expect("remove allowed file");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("internal_secret.txt", &allowed_file)
+        .expect("replace allowed file with symlink to secret");
+
+    // 3. Enforcement runs
+    let enforcement_res = harness.fs_enforcer.enforce_read(&req, &decision);
+
+    // Assert BlockedByFirewall, output == None, and secret never leaked
+    assert_ne!(
+        enforcement_res.observed_result,
+        ObservedResult::AccessSuccess,
+        "CRITICAL TOCTOU FAILURE: Enforcement permitted access after approved file was replaced by symlink!"
+    );
+    assert_eq!(
+        enforcement_res.observed_result,
+        ObservedResult::BlockedByFirewall,
+        "Enforcement must block the request when opened file does not match approved policy resource"
+    );
+    assert_eq!(
+        enforcement_res.output,
+        None,
+        "Output must be None on boundary violation"
+    );
+    assert!(
+        !enforcement_res.output.as_deref().unwrap_or_default().contains("CLASSIFIED_SECRET_019"),
+        "Secret must never appear in enforcement output"
+    );
+}
+
+
 
 
 

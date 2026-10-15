@@ -141,16 +141,16 @@ impl FilesystemEnforcer {
             }
         };
 
-        // Find enclosing sandbox root
+        // Find enclosing sandbox root. The sandbox root MUST enclose the authorized expected_path.
         let target_path = Path::new(raw_path);
         let expected_path = Path::new(expected_resolved_target);
-        let matching_root = self.find_sandbox_root(target_path, Some(expected_path), &decision_resp.matched_policy_id);
+        let matching_root = self.find_sandbox_root(expected_path, target_path, &decision_resp.matched_policy_id);
 
         let root_dir = match matching_root {
             Some(r) => r,
             None => {
-                // If no registered sandbox root encloses the path, check if path itself can be validated
-                warn!(target = %raw_path, "No sandbox root found to anchor kernel confinement");
+                // If no registered sandbox root encloses the path, fail-closed
+                warn!(target = %raw_path, expected = %expected_resolved_target, "No sandbox root found enclosing policy-approved resource");
                 return EnforcementResult {
                     enforcement_action: EnforcementAction::CanonicalBoundaryViolation,
                     observed_result: ObservedResult::BlockedByFirewall,
@@ -167,42 +167,38 @@ impl FilesystemEnforcer {
         self.enforce_kernel_confined_read(&root_dir, target_path, raw_path, expected_resolved_target)
     }
 
-    fn find_sandbox_root(&self, target_path: &Path, expected_path: Option<&Path>, _policy_id: &str) -> Option<PathBuf> {
+    fn find_sandbox_root(&self, expected_path: &Path, target_path: &Path, _policy_id: &str) -> Option<PathBuf> {
         let roots = self.sandbox_roots.read().expect("lock poisoned");
 
-        // Try to find the best matching root
+        // The sandbox root MUST enclose the policy-approved expected_path.
+        // If multiple roots enclose expected_path, select the most specific one (longest prefix).
+        let mut best_root: Option<PathBuf> = None;
         for root in roots.iter() {
-            if target_path.starts_with(root) {
-                return Some(root.clone());
-            }
-        }
-
-        // If target_path is relative or has lexical traversal, try lexical normalization
-        let normalized = Self::normalize_path(target_path);
-        for root in roots.iter() {
-            if normalized.starts_with(root) {
-                return Some(root.clone());
-            }
-        }
-
-        // Try matching root from expected_path (the resolved canonical path approved by policy)
-        if let Some(exp) = expected_path {
-            for root in roots.iter() {
-                if exp.starts_with(root) {
-                    return Some(root.clone());
-                }
-            }
-        }
-
-        // If not in explicitly registered roots, infer root from the parent of an allowed target
-        // if target_path parent exists
-        if let Some(parent) = target_path.parent() {
-            if let Ok(canon_parent) = parent.canonicalize() {
-                for root in roots.iter() {
-                    if canon_parent.starts_with(root) {
-                        return Some(root.clone());
+            if expected_path.starts_with(root) {
+                match &best_root {
+                    Some(current) => {
+                        if root.as_os_str().len() > current.as_os_str().len() {
+                            best_root = Some(root.clone());
+                        }
+                    }
+                    None => {
+                        best_root = Some(root.clone());
                     }
                 }
+            }
+        }
+
+        if best_root.is_some() {
+            return best_root;
+        }
+
+        // If expected_path was not directly enclosed, check if target_path or normalized target_path
+        // is enclosed by a registered root that also encloses expected_path.
+        // Notice: We strictly reject any fallback that infers a root from target_path.parent()
+        // which could select an unapproved root or re-read disk state.
+        for root in roots.iter() {
+            if target_path.starts_with(root) && expected_path.starts_with(root) {
+                return Some(root.clone());
             }
         }
 
@@ -368,18 +364,30 @@ impl FilesystemEnforcer {
             }
         };
 
-        let expected_path = Path::new(expected_resolved_target);
-        let paths_match = if opened_path == expected_path {
-            true
-        } else {
-            // Also compare canonicalized representations in case of mount aliases or symlink normalization
-            match (opened_path.canonicalize(), expected_path.canonicalize()) {
-                (Ok(op), Ok(ep)) => op == ep,
-                _ => false,
-            }
-        };
+        // Explicitly check for unlinked/deleted descriptor suffix from /proc/self/fd readlink.
+        let opened_str = opened_path.to_string_lossy();
+        if opened_str.ends_with(" (deleted)") {
+            unsafe { libc::close(file_fd); }
+            warn!(
+                opened = %opened_str,
+                "TOCTOU VIOLATION: Opened file descriptor was unlinked or marked deleted"
+            );
+            return EnforcementResult {
+                enforcement_action: EnforcementAction::CanonicalBoundaryViolation,
+                observed_result: ObservedResult::BlockedByFirewall,
+                output: None,
+                error_message: Some(format!(
+                    "TOCTOU violation detected: opened file '{}' was deleted/unlinked",
+                    opened_str
+                )),
+            };
+        }
 
-        if !paths_match {
+        // Exact path equality: expected_resolved_target is already canonical from policy resolution.
+        // We strictly disallow re-resolving expected_path from disk (e.g. via canonicalize), as an attacker
+        // who replaces the approved file with a symlink would cause both sides to re-resolve to the unauthorized target.
+        let expected_path = Path::new(expected_resolved_target);
+        if opened_path != expected_path {
             unsafe { libc::close(file_fd); }
             warn!(
                 expected = %expected_path.display(),
