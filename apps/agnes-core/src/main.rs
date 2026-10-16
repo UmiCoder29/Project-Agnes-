@@ -47,28 +47,46 @@ use std::path::{Path, PathBuf};
 ///
 /// Follows strict fail-closed requirements:
 /// - Reads a colon-separated list of paths (e.g. from AGNES_SANDBOX_ROOTS).
-/// - Each root must exist and be a directory.
-/// - If the variable is unset, empty, or if ANY entry is invalid (non-existent, regular file,
-///   unresolvable, or root "/"), logs a clear error and registers NO roots (reads stay denied).
-/// - Never defaults to "/" or the current working directory.
+/// - Each entry must be an absolute path (`p.is_absolute()`). Empty entries (leading, trailing, or
+///   doubled colons) and relative paths (e.g. `.` or `path/to/dir`) are strictly rejected.
+/// - Never defaults to "/" or resolves relative paths against the current working directory.
+/// - Each root must exist, be resolvable to canonical form, and be a directory other than root "/".
+/// - If the variable is unset, empty, or if ANY entry is invalid, logs a clear error and registers
+///   NO roots in the enforcer (ReadFile actions stay denied).
 pub fn configure_sandbox_roots(enforcer: &FilesystemEnforcer, roots_env: Option<&str>) -> Vec<PathBuf> {
     let raw = match roots_env {
-        Some(s) if !s.trim().is_empty() => s.trim(),
-        _ => {
-            error!("AGNES_SANDBOX_ROOTS is unset or empty; starting gateway with NO sandbox roots (ReadFile actions will be denied)");
+        Some(s) => s.trim(),
+        None => {
+            error!("AGNES_SANDBOX_ROOTS is unset; starting gateway with NO sandbox roots (ReadFile actions will be denied)");
             return Vec::new();
         }
     };
 
-    let entries: Vec<&str> = raw.split(':').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-    if entries.is_empty() {
-        error!("AGNES_SANDBOX_ROOTS contains no valid path entries; starting gateway with NO sandbox roots");
+    if raw.is_empty() {
+        error!("AGNES_SANDBOX_ROOTS is empty; starting gateway with NO sandbox roots (ReadFile actions will be denied)");
         return Vec::new();
     }
 
     let mut validated_roots = Vec::new();
-    for entry in &entries {
+    for raw_entry in raw.split(':') {
+        let entry = raw_entry.trim();
+        if entry.is_empty() {
+            error!(
+                raw = %raw,
+                "AGNES_SANDBOX_ROOTS contains an empty path entry (e.g. leading, trailing, or doubled colon); starting gateway with NO sandbox roots"
+            );
+            return Vec::new();
+        }
+
         let p = Path::new(entry);
+        if !p.is_absolute() {
+            error!(
+                root = %entry,
+                "AGNES_SANDBOX_ROOTS entry is not an absolute path; starting gateway with NO sandbox roots"
+            );
+            return Vec::new();
+        }
+
         let canonical = match p.canonicalize() {
             Ok(c) => c,
             Err(err) => {
@@ -263,7 +281,10 @@ async fn action_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agnes_common::{ActionPayload, ActionRequest, ActionType, Decision, EnforcementAction, ObservedResult};
+    use agnes_common::{
+        ActionPayload, ActionRequest, ActionType, Decision, DecisionReason, EnforcementAction,
+        ObservedResult, PolicyDecisionResponse,
+    };
     use agnes_policy::{Policy, PolicyRule};
     use std::fs;
     use tempfile::tempdir;
@@ -331,45 +352,179 @@ mod tests {
         assert_eq!(resp_outside.output, None);
     }
 
+    fn assert_enforcer_blocks_canary(enforcer: &FilesystemEnforcer, canary_file: &Path, context: &str) {
+        let req = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: canary_file.to_string_lossy().to_string(),
+            },
+        );
+        let decision = PolicyDecisionResponse {
+            decision: Decision::Allow,
+            reason: DecisionReason {
+                policy_id: "p-allow-all".to_string(),
+                rule_id: Some("r-allow".to_string()),
+                explanation: "Allow all".to_string(),
+            },
+            matched_policy_id: "p-allow-all".to_string(),
+            evaluated_at: chrono::Utc::now(),
+            resolved_resource: Some(canary_file.to_string_lossy().to_string()),
+        };
+
+        let result = enforcer.enforce_read(&req, &decision);
+        assert_eq!(
+            result.enforcement_action,
+            EnforcementAction::CanonicalBoundaryViolation,
+            "{}: Enforcer must produce CanonicalBoundaryViolation when no roots are registered",
+            context
+        );
+        assert_eq!(
+            result.observed_result,
+            ObservedResult::BlockedByFirewall,
+            "{}: Enforcer must produce BlockedByFirewall when no roots are registered",
+            context
+        );
+        assert_eq!(
+            result.output, None,
+            "{}: Enforcer must produce no output when blocked by firewall",
+            context
+        );
+    }
+
+    fn assert_enforcer_permits_canary(
+        enforcer: &FilesystemEnforcer,
+        canary_file: &Path,
+        expected_data: &str,
+        context: &str,
+    ) {
+        let req = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: canary_file.to_string_lossy().to_string(),
+            },
+        );
+        let decision = PolicyDecisionResponse {
+            decision: Decision::Allow,
+            reason: DecisionReason {
+                policy_id: "p-allow-all".to_string(),
+                rule_id: Some("r-allow".to_string()),
+                explanation: "Allow all".to_string(),
+            },
+            matched_policy_id: "p-allow-all".to_string(),
+            evaluated_at: chrono::Utc::now(),
+            resolved_resource: Some(canary_file.to_string_lossy().to_string()),
+        };
+
+        let result = enforcer.enforce_read(&req, &decision);
+        assert_eq!(
+            result.enforcement_action,
+            EnforcementAction::PermitExecution,
+            "{}: Enforcer must produce PermitExecution for valid root",
+            context
+        );
+        assert_eq!(
+            result.observed_result,
+            ObservedResult::AccessSuccess,
+            "{}: Enforcer must produce AccessSuccess for valid root",
+            context
+        );
+        assert_eq!(
+            result.output.as_deref(),
+            Some(expected_data),
+            "{}: Enforcer must return file contents for valid root",
+            context
+        );
+    }
+
     #[test]
     fn test_configure_sandbox_roots_fail_closed_validation() {
-        let enforcer = FilesystemEnforcer::new();
-
-        // Unset
-        let roots = configure_sandbox_roots(&enforcer, None);
-        assert!(roots.is_empty());
-
-        // Empty
-        let roots = configure_sandbox_roots(&enforcer, Some(""));
-        assert!(roots.is_empty());
-
-        // Non-existent path
-        let roots = configure_sandbox_roots(&enforcer, Some("/nonexistent_sandbox_dir_xyz_123"));
-        assert!(roots.is_empty());
-
-        // File instead of directory
         let temp_dir = tempdir().unwrap();
-        let file_path = temp_dir.path().join("file.txt");
-        fs::write(&file_path, "not a dir").unwrap();
-        let roots = configure_sandbox_roots(&enforcer, Some(&file_path.to_string_lossy()));
-        assert!(roots.is_empty());
-
-        // Root directory "/"
-        let roots = configure_sandbox_roots(&enforcer, Some("/"));
-        assert!(roots.is_empty());
-
-        // Mixed valid and invalid: must start with NO roots (all-or-nothing fail closed)
         let valid_dir = temp_dir.path().join("valid_dir");
         fs::create_dir_all(&valid_dir).unwrap();
-        let mixed = format!("{}:/nonexistent_xyz", valid_dir.display());
-        let roots = configure_sandbox_roots(&enforcer, Some(&mixed));
-        assert!(roots.is_empty());
+        let canary_file = valid_dir.join("canary.txt");
+        fs::write(&canary_file, "AUTHORIZED_CANARY_PAYLOAD").unwrap();
 
-        // Valid multiple colon-separated
-        let valid_dir2 = temp_dir.path().join("valid_dir2");
-        fs::create_dir_all(&valid_dir2).unwrap();
-        let multi = format!("{}:{}", valid_dir.display(), valid_dir2.display());
-        let roots = configure_sandbox_roots(&enforcer, Some(&multi));
-        assert_eq!(roots.len(), 2);
+        let file_path = temp_dir.path().join("file.txt");
+        fs::write(&file_path, "not a dir").unwrap();
+
+        let file_path_str = file_path.to_string_lossy().to_string();
+        let valid_dir_str = valid_dir.to_string_lossy().to_string();
+
+        let trailing_colon = format!("{}:", valid_dir_str);
+        let leading_colon = format!(":{}", valid_dir_str);
+        let doubled_colon = format!("{}::{}", valid_dir_str, valid_dir_str);
+        let mixed_valid_invalid = format!("{}:/nonexistent_sandbox_xyz_456", valid_dir_str);
+        let mixed_invalid_valid = format!("/nonexistent_sandbox_xyz_456:{}", valid_dir_str);
+        let mixed_valid_relative = format!("{}:relative/path", valid_dir_str);
+
+        let failing_cases: Vec<(Option<&str>, &str)> = vec![
+            (None, "unset (None)"),
+            (Some(""), "empty string"),
+            (Some("   "), "whitespace only"),
+            (Some("/nonexistent_sandbox_dir_xyz_123"), "non-existent absolute path"),
+            (Some(&file_path_str), "regular file instead of directory"),
+            (Some("/"), "root directory '/'"),
+            (Some(&trailing_colon), "trailing colon"),
+            (Some(&leading_colon), "leading colon"),
+            (Some(&doubled_colon), "doubled colon"),
+            (Some("relative/dir"), "relative path"),
+            (Some("."), "dot (current directory)"),
+            (Some("./relative"), "relative path prefixed with ./"),
+            (Some(".."), "parent directory '..'"),
+            (Some(&mixed_valid_invalid), "mixed valid and non-existent entry"),
+            (Some(&mixed_invalid_valid), "mixed non-existent entry and valid"),
+            (Some(&mixed_valid_relative), "mixed valid and relative path"),
+        ];
+
+        for (input, description) in failing_cases {
+            let enforcer = FilesystemEnforcer::new();
+            let roots = configure_sandbox_roots(&enforcer, input);
+            assert!(
+                roots.is_empty(),
+                "Case '{}' ({:?}) must register NO roots (returned {:?})",
+                description,
+                input,
+                roots
+            );
+            assert_enforcer_blocks_canary(&enforcer, &canary_file, description);
+        }
+
+        // Positive case: valid single root registers successfully and allows access
+        {
+            let enforcer = FilesystemEnforcer::new();
+            let roots = configure_sandbox_roots(&enforcer, Some(&valid_dir_str));
+            assert_eq!(roots.len(), 1);
+            assert_enforcer_permits_canary(
+                &enforcer,
+                &canary_file,
+                "AUTHORIZED_CANARY_PAYLOAD",
+                "valid single root",
+            );
+        }
+
+        // Positive case: valid multiple roots register successfully and allow access
+        {
+            let valid_dir2 = temp_dir.path().join("valid_dir2");
+            fs::create_dir_all(&valid_dir2).unwrap();
+            let canary_file2 = valid_dir2.join("canary2.txt");
+            fs::write(&canary_file2, "AUTHORIZED_CANARY_PAYLOAD_2").unwrap();
+
+            let enforcer = FilesystemEnforcer::new();
+            let multi = format!("{}:{}", valid_dir_str, valid_dir2.display());
+            let roots = configure_sandbox_roots(&enforcer, Some(&multi));
+            assert_eq!(roots.len(), 2);
+            assert_enforcer_permits_canary(
+                &enforcer,
+                &canary_file,
+                "AUTHORIZED_CANARY_PAYLOAD",
+                "valid multi-root (dir 1)",
+            );
+            assert_enforcer_permits_canary(
+                &enforcer,
+                &canary_file2,
+                "AUTHORIZED_CANARY_PAYLOAD_2",
+                "valid multi-root (dir 2)",
+            );
+        }
     }
 }
