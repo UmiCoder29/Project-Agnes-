@@ -42,7 +42,7 @@ impl FuzzEnv {
                 priority: 10,
             });
 
-        harness.policy_engine.add_policy(policy);
+        harness.policy_engine.add_policy(policy).unwrap();
 
         Self {
             _temp: temp,

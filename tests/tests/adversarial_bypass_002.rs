@@ -34,7 +34,7 @@ fn test_bypass_attempt_001_path_traversal() {
             priority: 10,
         });
 
-    harness.policy_engine.add_policy(policy);
+    harness.policy_engine.add_policy(policy).unwrap();
 
     // Adversarial Attempt: Path traversal payload attempting to escape allowed directory
     let traversal_payload = format!("{}/../forbidden/secret.txt", allowed_dir.to_str().unwrap());
@@ -102,7 +102,7 @@ fn test_bypass_attempt_002_symlink_escape() {
             priority: 10,
         });
 
-    harness.policy_engine.add_policy(policy);
+    harness.policy_engine.add_policy(policy).unwrap();
 
     let request = ActionRequest::new(
         "agent-001",
@@ -182,7 +182,7 @@ fn test_regression_symlink_inside_allowed_pointing_to_denied_evaluated_against_d
             priority: 10,
         });
 
-    harness.policy_engine.add_policy(policy);
+    harness.policy_engine.add_policy(policy).unwrap();
 
     // Action request targets the symlink located inside allowed directory
     let request = ActionRequest::new(
@@ -278,7 +278,7 @@ fn test_regression_nested_chained_symlinks_pointing_to_denied_path_evaluated_aga
             priority: 10,
         });
 
-    harness.policy_engine.add_policy(policy);
+    harness.policy_engine.add_policy(policy).unwrap();
 
     // 1. Verify ReadFile with chained symlink: must resolve to denied file and Deny
     let read_req = ActionRequest::new(

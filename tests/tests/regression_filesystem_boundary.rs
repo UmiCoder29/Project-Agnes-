@@ -1,7 +1,7 @@
 use agnes_common::{
     ActionPayload, ActionRequest, ActionType, Decision, EnforcementAction, ObservedResult,
 };
-use agnes_policy::{Policy, PolicyRule};
+use agnes_policy::{Policy, PolicyLoadError, PolicyRule};
 use agnes_tests::SecurityTestHarness;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -57,7 +57,7 @@ impl TestEnv {
                 priority: 10,
             });
 
-        harness.policy_engine.add_policy(policy);
+        harness.policy_engine.add_policy(policy).unwrap();
 
         Self {
             _temp: temp,
@@ -515,7 +515,7 @@ fn test_regression_016_whitespace_trimming_mismatch() {
             priority: 10,
         });
 
-    harness.policy_engine.add_policy(policy);
+    assert!(harness.policy_engine.add_policy(policy).is_err());
 
     let req = ActionRequest::new(
         "agent-001",
@@ -604,7 +604,7 @@ fn test_regression_017_single_path_resolution_per_request() {
             priority: 5,
         });
 
-    harness.policy_engine.add_policy(policy);
+    harness.policy_engine.add_policy(policy).unwrap();
 
     let req = ActionRequest::new(
         "agent-001",
@@ -676,7 +676,7 @@ fn test_regression_017_target_resolution_atomic_against_mid_evaluation_change() 
             priority: 10,
         });
 
-    harness.policy_engine.add_policy(policy);
+    harness.policy_engine.add_policy(policy).unwrap();
 
     let symlink_path_clone = symlink_path.clone();
     let allowed_target_clone = allowed_target.clone();
@@ -787,7 +787,7 @@ fn test_regression_018_toctou_symlink_swap_between_policy_and_enforcement() {
             priority: 20,
         });
 
-    harness.policy_engine.add_policy(policy);
+    harness.policy_engine.add_policy(policy).unwrap();
 
     let req = ActionRequest::new(
         "agent-001",
@@ -864,7 +864,7 @@ fn test_regression_018_non_race_path_succeeds() {
             priority: 10,
         });
 
-    harness.policy_engine.add_policy(policy);
+    harness.policy_engine.add_policy(policy).unwrap();
 
     let req = ActionRequest::new(
         "agent-001",
@@ -933,7 +933,7 @@ fn test_regression_019_approved_file_replaced_by_symlink() {
             priority: 20,
         });
 
-    harness.policy_engine.add_policy(policy);
+    harness.policy_engine.add_policy(policy).unwrap();
 
     let req = ActionRequest::new(
         "agent-001",
@@ -995,7 +995,7 @@ fn test_regression_020_zero_matching_rules_resolves_to_deny() {
         resource_pattern: "/sandbox/*".to_string(),
         priority: 10,
     });
-    harness.policy_engine.add_policy(policy);
+    harness.policy_engine.add_policy(policy).unwrap();
 
     let req = ActionRequest::new(
         "agent-001",
@@ -1051,7 +1051,7 @@ fn test_regression_022_evaluation_panic_fails_closed_to_deny() {
         resource_pattern: "*".to_string(),
         priority: 10,
     });
-    harness.policy_engine.add_policy(policy);
+    harness.policy_engine.add_policy(policy).unwrap();
 
     let req = ActionRequest::new(
         "agent-001",
@@ -1133,7 +1133,7 @@ fn test_regression_024_adversarial_empty_patterns_and_invalid_paths_denied() {
             resource_pattern: "*".to_string(),
             priority: 10,
         })
-    );
+    ).unwrap();
     let req = ActionRequest::new(
         "agent-001",
         ActionPayload::ReadFile {
@@ -1154,12 +1154,12 @@ fn test_regression_024_adversarial_empty_patterns_and_invalid_paths_denied() {
             resource_pattern: "*".to_string(),
             priority: 10,
         })
-    );
+    ).unwrap();
     assert_eq!(harness.policy_engine.evaluate(&req).decision, Decision::Deny);
 
-    // 3. Empty resource_pattern
+    // 3. Empty resource_pattern is rejected atomically at load time
     harness.policy_engine.clear();
-    harness.policy_engine.add_policy(
+    assert!(harness.policy_engine.add_policy(
         Policy::new("p3", "p", 1).with_rule(PolicyRule {
             id: "r3".to_string(),
             description: "r".to_string(),
@@ -1169,7 +1169,7 @@ fn test_regression_024_adversarial_empty_patterns_and_invalid_paths_denied() {
             resource_pattern: "".to_string(),
             priority: 10,
         })
-    );
+    ).is_err());
     assert_eq!(harness.policy_engine.evaluate(&req).decision, Decision::Deny);
 
     // 4. Unresolvable path with null byte under allow-all
@@ -1184,7 +1184,7 @@ fn test_regression_024_adversarial_empty_patterns_and_invalid_paths_denied() {
             resource_pattern: "*".to_string(),
             priority: 10,
         })
-    );
+    ).unwrap();
     let req_null = ActionRequest::new(
         "agent-001",
         ActionPayload::ReadFile {
@@ -1218,7 +1218,7 @@ fn test_regression_025_symlink_loop_resolves_to_deny() {
         resource_pattern: "*".to_string(),
         priority: 10,
     });
-    harness.policy_engine.add_policy(policy);
+    harness.policy_engine.add_policy(policy).unwrap();
 
     let req = ActionRequest::new(
         "agent-001",
@@ -1280,7 +1280,7 @@ fn test_regression_026_precedence_most_specific_match_and_deny_on_ambiguity() {
                 resource_pattern: format!("{}/*", sub_dir.display()),
                 priority: 10,
             });
-        harness.policy_engine.add_policy(policy);
+        harness.policy_engine.add_policy(policy).unwrap();
 
         // Read in sub must be Denied because sub_dir is more specific
         let req_sub = ActionRequest::new(
@@ -1336,7 +1336,7 @@ fn test_regression_026_precedence_most_specific_match_and_deny_on_ambiguity() {
                 resource_pattern: format!("{}/*", sub_dir.display()),
                 priority: 10,
             });
-        harness.policy_engine.add_policy(policy);
+        harness.policy_engine.add_policy(policy).unwrap();
 
         // Read in sub must be Allowed because sub_dir rule is more specific than parent rule
         let req_sub = ActionRequest::new(
@@ -1392,7 +1392,7 @@ fn test_regression_026_precedence_most_specific_match_and_deny_on_ambiguity() {
                 resource_pattern: format!("{}/*", sub_dir.display()),
                 priority: 10,
             });
-        harness.policy_engine.add_policy(policy);
+        harness.policy_engine.add_policy(policy).unwrap();
 
         let req_sub = ActionRequest::new(
             "agent-001",
@@ -1470,7 +1470,7 @@ fn test_regression_027_symlinked_rule_patterns_resolved_at_load_time() {
                 resource_pattern: format!("{}/*", symlink_denied.display()),
                 priority: 10,
             });
-        harness.policy_engine.add_policy(policy);
+        harness.policy_engine.add_policy(policy).unwrap();
 
         // Accessing the real target must be Denied
         let req = ActionRequest::new(
@@ -1500,7 +1500,7 @@ fn test_regression_027_symlinked_rule_patterns_resolved_at_load_time() {
             resource_pattern: format!("{}/*", symlink_allowed.display()),
             priority: 10,
         });
-        harness.policy_engine.add_policy(policy);
+        harness.policy_engine.add_policy(policy).unwrap();
 
         // Access to allowed file via real path succeeds
         let req_allowed = ActionRequest::new(
@@ -1556,7 +1556,7 @@ fn test_regression_027_symlinked_rule_patterns_resolved_at_load_time() {
             resource_pattern: format!("{}/*", symlink_switchable.display()),
             priority: 10,
         });
-        harness.policy_engine.add_policy(policy);
+        harness.policy_engine.add_policy(policy).unwrap();
 
         // Initially reading narrow file is Allowed
         let req_narrow = ActionRequest::new(
@@ -1623,9 +1623,16 @@ fn test_regression_028_unresolvable_rule_pattern_rejected_at_load_time() {
         priority: 10,
     });
     // Add policy: unresolvable rule must be rejected at load time
-    harness.policy_engine.add_policy(policy);
+    let res = harness.policy_engine.add_policy(policy);
+    assert!(
+        res.is_err(),
+        "Policy with unresolvable rule pattern must fail to load atomically"
+    );
+    let err: PolicyLoadError = res.unwrap_err();
+    assert_eq!(err.policy_id(), Some("p-bad-pattern"));
+    assert_eq!(err.rule_id(), Some("rule-bad-loop"));
 
-    // Request should receive default Deny because the bad rule was rejected
+    // Request should receive default Deny because the entire policy was rejected
     let req = ActionRequest::new(
         "agent-001",
         ActionPayload::ReadFile {
@@ -1638,7 +1645,427 @@ fn test_regression_028_unresolvable_rule_pattern_rejected_at_load_time() {
         Decision::Deny,
         "Policy with unresolvable rule pattern must fail-closed to Deny"
     );
+    assert_eq!(report.policy, "default-fail-closed");
 }
+
+// REGRESSION-029: Never drop a Deny rule silently.
+// If ANY rule in a policy fails to resolve, reject the WHOLE policy, load nothing from it,
+// and leave previously loaded policies untouched.
+
+#[test]
+fn test_regression_029_leading_space_pattern_rejects_whole_policy_and_denies() {
+    let temp = tempdir().expect("tempdir failed");
+    let sandbox_root = temp.path().join("sandbox");
+    let secret_dir = sandbox_root.join("secret");
+    fs::create_dir_all(&secret_dir).expect("mkdir secret");
+
+    let secret_file = secret_dir.join("k.txt");
+    fs::write(&secret_file, "SECRET_KEY").expect("write secret");
+
+    let harness = SecurityTestHarness::new();
+    harness.fs_enforcer.register_sandbox_root(&sandbox_root);
+
+    // Case 1: Allow root/* at priority 10 + Deny leading-space secret/* at priority 100
+    let policy = Policy::new("p-leading-space", "Leading Space Repro", 1)
+        .with_rule(PolicyRule {
+            id: "rule-allow-root".to_string(),
+            description: "Allow all under sandbox".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/*", sandbox_root.display()),
+            priority: 10,
+        })
+        .with_rule(PolicyRule {
+            id: "rule-deny-secret".to_string(),
+            description: "Deny secret with leading space".to_string(),
+            decision: Decision::Deny,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!(" {}/*", secret_dir.display()),
+            priority: 100,
+        });
+
+    let load_res = harness.policy_engine.add_policy(policy);
+    assert!(load_res.is_err(), "Must reject entire policy on leading-space rule pattern");
+    let err = load_res.unwrap_err();
+    assert_eq!(err.policy_id(), Some("p-leading-space"));
+    assert_eq!(err.rule_id(), Some("rule-deny-secret"));
+
+    let req = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: secret_file.to_str().unwrap().to_string(),
+        },
+    ).with_test_id("REGRESSION-029-LEADING-SPACE");
+
+    let report = harness.execute_request(req);
+    // On 7f98b41, rule-deny-secret was silently dropped, and rule-allow-root allowed the read!
+    // With atomic loading, the policy must be rejected, and the request must be Denied.
+    assert_eq!(
+        report.decision,
+        Decision::Deny,
+        "Deny rule with leading space must NOT be silently dropped to allow access!"
+    );
+    assert_eq!(report.observed_result, ObservedResult::BlockedByFirewall);
+    assert_eq!(report.policy, "default-fail-closed");
+}
+
+#[test]
+fn test_regression_029_trailing_space_pattern_rejects_whole_policy_and_denies() {
+    let temp = tempdir().expect("tempdir failed");
+    let sandbox_root = temp.path().join("sandbox");
+    let secret_dir = sandbox_root.join("secret");
+    fs::create_dir_all(&secret_dir).expect("mkdir secret");
+
+    let secret_file = secret_dir.join("k.txt");
+    fs::write(&secret_file, "SECRET_KEY").expect("write secret");
+
+    let harness = SecurityTestHarness::new();
+    harness.fs_enforcer.register_sandbox_root(&sandbox_root);
+
+    // Case 2: Allow root/* at priority 10 + Deny trailing-space secret/* at priority 100
+    let policy = Policy::new("p-trailing-space", "Trailing Space Repro", 1)
+        .with_rule(PolicyRule {
+            id: "rule-allow-root".to_string(),
+            description: "Allow all under sandbox".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/*", sandbox_root.display()),
+            priority: 10,
+        })
+        .with_rule(PolicyRule {
+            id: "rule-deny-secret".to_string(),
+            description: "Deny secret with trailing space".to_string(),
+            decision: Decision::Deny,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/* ", secret_dir.display()),
+            priority: 100,
+        });
+
+    let load_res = harness.policy_engine.add_policy(policy);
+    assert!(load_res.is_err(), "Must reject entire policy on trailing-space rule pattern");
+    let err = load_res.unwrap_err();
+    assert_eq!(err.policy_id(), Some("p-trailing-space"));
+    assert_eq!(err.rule_id(), Some("rule-deny-secret"));
+
+    let req = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: secret_file.to_str().unwrap().to_string(),
+        },
+    ).with_test_id("REGRESSION-029-TRAILING-SPACE");
+
+    let report = harness.execute_request(req);
+    assert_eq!(
+        report.decision,
+        Decision::Deny,
+        "Deny rule with trailing space must NOT be silently dropped to allow access!"
+    );
+    assert_eq!(report.observed_result, ObservedResult::BlockedByFirewall);
+    assert_eq!(report.policy, "default-fail-closed");
+}
+
+#[test]
+fn test_regression_029_symlink_loop_pattern_rejects_whole_policy_and_denies() {
+    let temp = tempdir().expect("tempdir failed");
+    let sandbox_root = temp.path().join("sandbox");
+    let secret_dir = sandbox_root.join("secret");
+    fs::create_dir_all(&secret_dir).expect("mkdir secret");
+
+    let secret_file = secret_dir.join("k.txt");
+    fs::write(&secret_file, "SECRET_KEY").expect("write secret");
+
+    let loop_a = temp.path().join("loop_pattern_a");
+    let loop_b = temp.path().join("loop_pattern_b");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&loop_b, &loop_a).expect("symlink a");
+        std::os::unix::fs::symlink(&loop_a, &loop_b).expect("symlink b");
+    }
+
+    let harness = SecurityTestHarness::new();
+    harness.fs_enforcer.register_sandbox_root(&sandbox_root);
+
+    // Case 3: Allow root/* at priority 10 + Deny symlink-loop pattern at priority 100
+    let policy = Policy::new("p-symlink-loop", "Symlink Loop Repro", 1)
+        .with_rule(PolicyRule {
+            id: "rule-allow-root".to_string(),
+            description: "Allow all under sandbox".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/*", sandbox_root.display()),
+            priority: 10,
+        })
+        .with_rule(PolicyRule {
+            id: "rule-deny-loop".to_string(),
+            description: "Deny pattern containing symlink loop".to_string(),
+            decision: Decision::Deny,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/*", loop_a.display()),
+            priority: 100,
+        });
+
+    let load_res = harness.policy_engine.add_policy(policy);
+    assert!(load_res.is_err(), "Must reject entire policy on symlink-loop rule pattern");
+    let err = load_res.unwrap_err();
+    assert_eq!(err.policy_id(), Some("p-symlink-loop"));
+    assert_eq!(err.rule_id(), Some("rule-deny-loop"));
+
+    let req = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: secret_file.to_str().unwrap().to_string(),
+        },
+    ).with_test_id("REGRESSION-029-SYMLINK-LOOP");
+
+    let report = harness.execute_request(req);
+    assert_eq!(
+        report.decision,
+        Decision::Deny,
+        "Deny rule with symlink loop must NOT be silently dropped to allow access!"
+    );
+    assert_eq!(report.observed_result, ObservedResult::BlockedByFirewall);
+    assert_eq!(report.policy, "default-fail-closed");
+}
+
+#[test]
+fn test_regression_029_null_byte_pattern_rejects_whole_policy_and_denies() {
+    let temp = tempdir().expect("tempdir failed");
+    let sandbox_root = temp.path().join("sandbox");
+    let secret_dir = sandbox_root.join("secret");
+    fs::create_dir_all(&secret_dir).expect("mkdir secret");
+
+    let secret_file = secret_dir.join("k.txt");
+    fs::write(&secret_file, "SECRET_KEY").expect("write secret");
+
+    let harness = SecurityTestHarness::new();
+    harness.fs_enforcer.register_sandbox_root(&sandbox_root);
+
+    // Case 4: Allow root/* at priority 10 + Deny null-byte pattern at priority 100
+    let policy = Policy::new("p-null-byte", "Null Byte Repro", 1)
+        .with_rule(PolicyRule {
+            id: "rule-allow-root".to_string(),
+            description: "Allow all under sandbox".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/*", sandbox_root.display()),
+            priority: 10,
+        })
+        .with_rule(PolicyRule {
+            id: "rule-deny-null".to_string(),
+            description: "Deny pattern containing null byte".to_string(),
+            decision: Decision::Deny,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}\0/*", secret_dir.display()),
+            priority: 100,
+        });
+
+    let load_res = harness.policy_engine.add_policy(policy);
+    assert!(load_res.is_err(), "Must reject entire policy on null-byte rule pattern");
+    let err = load_res.unwrap_err();
+    assert_eq!(err.policy_id(), Some("p-null-byte"));
+    assert_eq!(err.rule_id(), Some("rule-deny-null"));
+
+    let req = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: secret_file.to_str().unwrap().to_string(),
+        },
+    ).with_test_id("REGRESSION-029-NULL-BYTE");
+
+    let report = harness.execute_request(req);
+    assert_eq!(
+        report.decision,
+        Decision::Deny,
+        "Deny rule with null byte must NOT be silently dropped to allow access!"
+    );
+    assert_eq!(report.observed_result, ObservedResult::BlockedByFirewall);
+    assert_eq!(report.policy, "default-fail-closed");
+}
+
+#[test]
+fn test_regression_029_rejected_policy_leaves_existing_valid_policy_in_force() {
+    let temp = tempdir().expect("tempdir failed");
+    let sandbox_root = temp.path().join("sandbox");
+    let public_dir = sandbox_root.join("public");
+    let other_dir = sandbox_root.join("other");
+    fs::create_dir_all(&public_dir).expect("mkdir public");
+    fs::create_dir_all(&other_dir).expect("mkdir other");
+
+    let public_file = public_dir.join("public.txt");
+    let other_file = other_dir.join("other.txt");
+    fs::write(&public_file, "PUBLIC_DATA").expect("write public");
+    fs::write(&other_file, "OTHER_DATA").expect("write other");
+
+    let harness = SecurityTestHarness::new();
+    harness.fs_enforcer.register_sandbox_root(&sandbox_root);
+
+    // 1. Successfully load a valid policy
+    let valid_policy = Policy::new("p-already-loaded", "Valid Active Policy", 1).with_rule(PolicyRule {
+        id: "rule-allow-public".to_string(),
+        description: "Allow public access".to_string(),
+        decision: Decision::Allow,
+        agent_pattern: "agent-001".to_string(),
+        action_types: vec![ActionType::ReadFile],
+        resource_pattern: format!("{}/*", public_dir.display()),
+        priority: 10,
+    });
+    harness.policy_engine.add_policy(valid_policy).expect("load valid policy");
+
+    let req_public = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: public_file.to_str().unwrap().to_string(),
+        },
+    ).with_test_id("REGRESSION-029-PUBLIC-INITIAL");
+    let report_initial = harness.execute_request(req_public.clone());
+    assert_eq!(report_initial.decision, Decision::Allow);
+    assert_eq!(report_initial.policy, "p-already-loaded");
+
+    // 2. Attempt to load an invalid policy with a bad rule pattern (leading space)
+    let bad_policy = Policy::new("p-bad-rejected", "Rejected Policy", 1)
+        .with_rule(PolicyRule {
+            id: "rule-allow-other".to_string(),
+            description: "Allow other".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/*", other_dir.display()),
+            priority: 10,
+        })
+        .with_rule(PolicyRule {
+            id: "rule-bad-space".to_string(),
+            description: "Bad space pattern".to_string(),
+            decision: Decision::Deny,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: " /secret/*".to_string(),
+            priority: 100,
+        });
+
+    let load_res = harness.policy_engine.add_policy(bad_policy);
+    assert!(load_res.is_err(), "Rejected policy must return Err");
+
+    // 3. The already-loaded policy must remain fully in force
+    let report_after = harness.execute_request(req_public);
+    assert_eq!(
+        report_after.decision,
+        Decision::Allow,
+        "Existing valid policy must remain intact and in force after rejected policy"
+    );
+    assert_eq!(report_after.policy, "p-already-loaded");
+
+    // 4. The rejected policy's rules were not registered (other file must Deny fail-closed)
+    let req_other = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: other_file.to_str().unwrap().to_string(),
+        },
+    ).with_test_id("REGRESSION-029-OTHER-DENIED");
+    let report_other = harness.execute_request(req_other);
+    assert_eq!(
+        report_other.decision,
+        Decision::Deny,
+        "Rules from rejected policy must not be active"
+    );
+    assert_eq!(report_other.policy, "default-fail-closed");
+}
+
+#[test]
+fn test_regression_029_adversarial_last_rule_invalid_proves_no_partial_load() {
+    let temp = tempdir().expect("tempdir failed");
+    let sandbox_root = temp.path().join("sandbox");
+    let first_dir = sandbox_root.join("first");
+    let second_dir = sandbox_root.join("second");
+    let third_dir = sandbox_root.join("third");
+    fs::create_dir_all(&first_dir).expect("mkdir first");
+    fs::create_dir_all(&second_dir).expect("mkdir second");
+    fs::create_dir_all(&third_dir).expect("mkdir third");
+
+    let first_file = first_dir.join("file1.txt");
+    let second_file = second_dir.join("file2.txt");
+    fs::write(&first_file, "DATA_1").expect("write 1");
+    fs::write(&second_file, "DATA_2").expect("write 2");
+
+    let harness = SecurityTestHarness::new();
+    harness.fs_enforcer.register_sandbox_root(&sandbox_root);
+
+    // Policy where Rules 1 and 2 are completely valid, but the LAST rule (Rule 3) has an invalid pattern
+    let policy = Policy::new("p-partial-adversarial", "Adversarial Partial Load Attempt", 1)
+        .with_rule(PolicyRule {
+            id: "rule-valid-1".to_string(),
+            description: "Valid rule 1".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/*", first_dir.display()),
+            priority: 10,
+        })
+        .with_rule(PolicyRule {
+            id: "rule-valid-2".to_string(),
+            description: "Valid rule 2".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/*", second_dir.display()),
+            priority: 10,
+        })
+        .with_rule(PolicyRule {
+            id: "rule-bad-last".to_string(),
+            description: "Invalid last rule with leading space".to_string(),
+            decision: Decision::Deny,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!(" {}/*", third_dir.display()),
+            priority: 100,
+        });
+
+    let res = harness.policy_engine.add_policy(policy);
+    assert!(
+        res.is_err(),
+        "Policy with invalid last rule must be completely rejected"
+    );
+    let err = res.unwrap_err();
+    assert_eq!(err.policy_id(), Some("p-partial-adversarial"));
+    assert_eq!(err.rule_id(), Some("rule-bad-last"));
+
+    // Proving NO partial load occurred: requests matching rule-valid-1 and rule-valid-2 must be Denied
+    let req1 = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: first_file.to_str().unwrap().to_string(),
+        },
+    ).with_test_id("REGRESSION-029-NO-PARTIAL-1");
+    let report1 = harness.execute_request(req1);
+    assert_eq!(
+        report1.decision,
+        Decision::Deny,
+        "Rule 1 must NOT have been partially loaded into engine!"
+    );
+    assert_eq!(report1.policy, "default-fail-closed");
+
+    let req2 = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: second_file.to_str().unwrap().to_string(),
+        },
+    ).with_test_id("REGRESSION-029-NO-PARTIAL-2");
+    let report2 = harness.execute_request(req2);
+    assert_eq!(
+        report2.decision,
+        Decision::Deny,
+        "Rule 2 must NOT have been partially loaded into engine!"
+    );
+    assert_eq!(report2.policy, "default-fail-closed");
+}
+
 
 
 

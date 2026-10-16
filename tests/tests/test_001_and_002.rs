@@ -30,7 +30,7 @@ fn test_001_allowed_file_read() {
             priority: 10,
         });
 
-    harness.policy_engine.add_policy(policy);
+    harness.policy_engine.add_policy(policy).unwrap();
 
     // Build Request
     let request = ActionRequest::new(
@@ -77,7 +77,7 @@ fn test_002_forbidden_file_read() {
             priority: 10,
         });
 
-    harness.policy_engine.add_policy(policy);
+    harness.policy_engine.add_policy(policy).unwrap();
 
     // Build Request to read forbidden file
     let request = ActionRequest::new(

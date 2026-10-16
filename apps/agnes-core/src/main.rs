@@ -16,7 +16,7 @@ use agnes_policy::{Policy, PolicyEngine};
 use agnes_state::StateEngine;
 use agnes_telemetry::{InMemoryTelemetrySink, StructuredJsonLogSink, TelemetrySink};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
@@ -176,8 +176,25 @@ async fn add_policy_handler(
     Json(policy): Json<Policy>,
 ) -> impl IntoResponse {
     info!(policy_id = %policy.id, rules_count = policy.rules.len(), "Registering policy");
-    state.policy_engine.add_policy(policy);
-    (StatusCode::CREATED, Json(serde_json::json!({ "status": "Policy registered" })))
+    match state.policy_engine.add_policy(policy) {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "status": "Policy registered" })),
+        ),
+        Err(err) => {
+            warn!(error = %err, "Failed to register policy: rejecting whole policy");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Failed to register policy",
+                    "details": err.to_string(),
+                    "policy_id": err.policy_id(),
+                    "rule_id": err.rule_id(),
+                    "reason": err.reason(),
+                })),
+            )
+        }
+    }
 }
 
 async fn list_events_handler(
@@ -316,7 +333,7 @@ mod tests {
             action_types: vec![ActionType::ReadFile],
             resource_pattern: "*".to_string(),
             priority: 10,
-        }));
+        })).unwrap();
 
         let state = AppState {
             policy_engine,
@@ -526,5 +543,79 @@ mod tests {
                 "valid multi-root (dir 2)",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_post_policies_endpoint_rejects_invalid_pattern_with_400_and_registers_nothing() {
+        let state = Arc::new(AppState {
+            policy_engine: PolicyEngine::new(),
+            state_engine: StateEngine::new(),
+            fs_enforcer: FilesystemEnforcer::new(),
+            memory_sink: InMemoryTelemetrySink::new(),
+            log_sink: StructuredJsonLogSink,
+        });
+
+        // 1. Policy with a rule containing an unresolvable pattern (leading space)
+        let invalid_policy = Policy::new("p-bad-lead-space", "Invalid Policy", 1)
+            .with_rule(PolicyRule {
+                id: "rule-allow".to_string(),
+                description: "Allow all".to_string(),
+                decision: Decision::Allow,
+                agent_pattern: "*".to_string(),
+                action_types: vec![ActionType::ReadFile],
+                resource_pattern: "*".to_string(),
+                priority: 10,
+            })
+            .with_rule(PolicyRule {
+                id: "rule-bad-deny".to_string(),
+                description: "Deny with leading space".to_string(),
+                decision: Decision::Deny,
+                agent_pattern: "*".to_string(),
+                action_types: vec![ActionType::ReadFile],
+                resource_pattern: " /secret/*".to_string(),
+                priority: 100,
+            });
+
+        let response = add_policy_handler(State(state.clone()), Json(invalid_policy)).await.into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "POST /v1/policies must return HTTP 400 Bad Request on invalid rule pattern"
+        );
+
+        // 2. Engine must have registered NOTHING from the invalid policy (default deny)
+        let req = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: "/tmp/anything.txt".to_string(),
+            },
+        );
+        let eval = state.policy_engine.evaluate(&req);
+        assert_eq!(
+            eval.decision,
+            Decision::Deny,
+            "Rejected policy must not leave partial rules registered in engine"
+        );
+        assert_eq!(eval.matched_policy_id, "default-fail-closed");
+
+        // 3. Positive verification: valid policy returns 201 Created and registers
+        let valid_policy = Policy::new("p-good", "Valid Policy", 1)
+            .with_rule(PolicyRule {
+                id: "rule-allow".to_string(),
+                description: "Allow all".to_string(),
+                decision: Decision::Allow,
+                agent_pattern: "*".to_string(),
+                action_types: vec![ActionType::ReadFile],
+                resource_pattern: "*".to_string(),
+                priority: 10,
+            });
+
+        let good_response = add_policy_handler(State(state.clone()), Json(valid_policy)).await.into_response();
+        assert_eq!(
+            good_response.status(),
+            StatusCode::CREATED,
+            "POST /v1/policies must return HTTP 201 Created on valid policy"
+        );
+        assert_eq!(state.policy_engine.evaluate(&req).decision, Decision::Allow);
     }
 }

@@ -1,8 +1,10 @@
 pub mod engine;
+pub mod error;
 pub mod model;
 pub mod path;
 
 pub use engine::PolicyEngine;
+pub use error::PolicyLoadError;
 pub use model::{resolve_resource_pattern, Policy, PolicyRule, RuleSpecificity};
 pub use path::{is_path_resource, resolve_real_path, resolve_request_target};
 

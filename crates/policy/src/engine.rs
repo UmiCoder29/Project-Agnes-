@@ -3,6 +3,7 @@ use agnes_common::{ActionRequest, Decision, DecisionReason, PolicyDecisionRespon
 use chrono::Utc;
 use tracing::{debug, info};
 
+use crate::error::PolicyLoadError;
 use crate::model::{Policy, PolicyRule};
 use crate::path::resolve_request_target;
 
@@ -18,44 +19,31 @@ impl PolicyEngine {
         }
     }
 
-    pub fn add_policy(&self, policy: Policy) {
+    /// Loads a policy into the engine atomically.
+    ///
+    /// Atomic Guarantee:
+    /// Validates and resolves all rule patterns in the policy BEFORE modifying the engine's state.
+    /// If ANY rule fails validation (e.g. symlink loop, invalid path, null byte, leading/trailing whitespace),
+    /// the ENTIRE policy is rejected with `PolicyLoadError::InvalidRulePattern`, no rules from it are loaded,
+    /// and all previously loaded policies remain completely untouched.
+    pub fn add_policy(&self, mut policy: Policy) -> Result<(), PolicyLoadError> {
+        // 1. Validate and resolve all rule patterns atomically BEFORE modifying state
+        policy.validate_and_resolve_patterns()?;
+
+        // 2. Commit the policy atomically under write lock
         let mut guard = match self.policies.write() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        let mut validated_rules = Vec::new();
-        for mut rule in policy.rules {
-            match rule.resolve_pattern() {
-                Ok(()) => {
-                    validated_rules.push(rule);
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        policy_id = %policy.id,
-                        rule_id = %rule.id,
-                        pattern = %rule.resource_pattern,
-                        error = %err,
-                        "Rejecting policy rule with unresolvable pattern at load time (fail-closed)"
-                    );
-                }
-            }
-        }
-
-        let validated_policy = Policy {
-            id: policy.id,
-            name: policy.name,
-            version: policy.version,
-            rules: validated_rules,
-        };
-
         info!(
-            policy_id = %validated_policy.id,
-            policy_name = %validated_policy.name,
-            rules_count = validated_policy.rules.len(),
+            policy_id = %policy.id,
+            policy_name = %policy.name,
+            rules_count = policy.rules.len(),
             "Loaded policy into engine"
         );
-        guard.push(validated_policy);
+        guard.push(policy);
+        Ok(())
     }
 
     /// Clears all loaded policies and clears any lock poison flag.
@@ -70,13 +58,12 @@ impl PolicyEngine {
         self.policies.clear_poison();
     }
 
-    /// Loads and registers a policy from a JSON configuration string.
+    /// Loads and registers a policy from a JSON configuration string atomically.
     /// Uses Policy::from_json as the single canonical parsing entrypoint.
-    /// If parsing fails, the previously loaded policy set is left completely unmodified (atomic).
-    pub fn load_policy_from_json(&self, json_str: &str) -> Result<(), serde_json::Error> {
+    /// If parsing or pattern resolution fails, the previously loaded policy set is left completely unmodified (atomic).
+    pub fn load_policy_from_json(&self, json_str: &str) -> Result<(), PolicyLoadError> {
         let policy = Policy::from_json(json_str)?;
-        self.add_policy(policy);
-        Ok(())
+        self.add_policy(policy)
     }
 
     /// Evaluates an ActionRequest deterministically.
@@ -207,7 +194,9 @@ impl PolicyEngine {
         // Precedence Order:
         // 1. Priority DESC: Highest numeric priority wins (explicit administrative override).
         // 2. Specificity DESC: When priorities are equal, the most-specific match wins:
-        //    - Exact matches (is_exact = true) beat all wildcard/prefix patterns.
+        //    - Exact-path rules (is_exact = true) beat wildcard/prefix rules regardless of decision!
+        //      At equal priority, an exact-path Allow beats a wildcard Deny, and an exact-path Deny
+        //      beats a wildcard Allow.
         //    - Deeper directory prefixes (more path components) beat shallower parent directories
         //      (e.g., an Allow or Deny on /a/b/c/* beats a rule on /a/b/* or /a/*).
         //    - Longer prefix character lengths break ties between rules with identical component counts.
@@ -319,7 +308,7 @@ mod tests {
             resource_pattern: "/sandbox/file.txt".to_string(),
             priority: 10,
         });
-        engine.add_policy(policy);
+        assert!(engine.add_policy(policy).is_ok());
 
         let decision = engine.evaluate(&req);
         assert_eq!(
@@ -390,7 +379,7 @@ mod tests {
             resource_pattern: "*".to_string(),
             priority: 10,
         });
-        engine.add_policy(policy);
+        assert!(engine.add_policy(policy).is_ok());
 
         let req = ActionRequest::new(
             "agent-001",
@@ -430,7 +419,7 @@ mod tests {
             resource_pattern: "*".to_string(),
             priority: 10,
         });
-        engine.add_policy(policy.clone());
+        assert!(engine.add_policy(policy.clone()).is_ok());
 
         let req = ActionRequest::new(
             "agent-001",
@@ -460,7 +449,7 @@ mod tests {
         engine.clear();
 
         // Re-add known-good policy
-        engine.add_policy(policy);
+        assert!(engine.add_policy(policy).is_ok());
 
         // Subsequent evaluation succeeds with Allow
         let decision_recovered = engine.evaluate(&req);
@@ -486,7 +475,7 @@ mod tests {
             resource_pattern: "*".to_string(),
             priority: 10,
         });
-        engine.add_policy(policy_empty_agent);
+        assert!(engine.add_policy(policy_empty_agent).is_ok());
 
         let req = ActionRequest::new(
             "agent-001",
@@ -507,10 +496,10 @@ mod tests {
             resource_pattern: "*".to_string(),
             priority: 10,
         });
-        engine.add_policy(policy_empty_actions);
+        assert!(engine.add_policy(policy_empty_actions).is_ok());
         assert_eq!(engine.evaluate(&req).decision, Decision::Deny);
 
-        // Rule with empty resource_pattern
+        // Rule with empty resource_pattern fails atomic pattern resolution at load time
         engine.clear();
         let policy_empty_resource = Policy::new("p-empty-resource", "p", 1).with_rule(PolicyRule {
             id: "r3".to_string(),
@@ -521,7 +510,7 @@ mod tests {
             resource_pattern: "".to_string(),
             priority: 10,
         });
-        engine.add_policy(policy_empty_resource);
+        assert!(engine.add_policy(policy_empty_resource).is_err());
         assert_eq!(engine.evaluate(&req).decision, Decision::Deny);
     }
 
@@ -538,7 +527,7 @@ mod tests {
             resource_pattern: "*".to_string(),
             priority: 10,
         });
-        engine.add_policy(policy);
+        assert!(engine.add_policy(policy).is_ok());
 
         // Path with null byte
         let req_null = ActionRequest::new(
@@ -572,7 +561,7 @@ mod tests {
             resource_pattern: "*".to_string(),
             priority: 10,
         });
-        engine.add_policy(policy);
+        assert!(engine.add_policy(policy).is_ok());
 
         // Malformed request with unknown action type string
         let malformed_req_json = r#"{
@@ -662,7 +651,7 @@ mod tests {
             resource_pattern: "*".to_string(),
             priority: 10,
         });
-        engine.add_policy(policy);
+        assert!(engine.add_policy(policy).is_ok());
 
         let req = ActionRequest::new(
             "agent-001",
@@ -678,6 +667,87 @@ mod tests {
             "Request targeting a symlink loop must resolve to Deny"
         );
         assert_eq!(decision.matched_policy_id, "fail-closed-path-resolution");
+    }
+
+    // Exact-path match beats wildcard/prefix pattern at equal priority regardless of decision.
+    #[test]
+    fn test_exact_path_beats_wildcard_regardless_of_decision_at_equal_priority() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target_file = temp_dir.path().join("canary.txt");
+        std::fs::write(&target_file, "DATA").unwrap();
+        let target_str = target_file.to_string_lossy().to_string();
+        let wildcard_str = format!("{}/*", temp_dir.path().display());
+
+        let req = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: target_str.clone(),
+            },
+        );
+
+        // Case A: Exact Allow beats Wildcard Deny at equal priority (10)
+        {
+            let engine = PolicyEngine::new();
+            let policy = Policy::new("p-exact-allow", "Exact Allow vs Wildcard Deny", 1)
+                .with_rule(PolicyRule {
+                    id: "r-wildcard-deny".to_string(),
+                    description: "Deny wildcard".to_string(),
+                    decision: Decision::Deny,
+                    agent_pattern: "*".to_string(),
+                    action_types: vec![ActionType::ReadFile],
+                    resource_pattern: wildcard_str.clone(),
+                    priority: 10,
+                })
+                .with_rule(PolicyRule {
+                    id: "r-exact-allow".to_string(),
+                    description: "Allow exact file".to_string(),
+                    decision: Decision::Allow,
+                    agent_pattern: "*".to_string(),
+                    action_types: vec![ActionType::ReadFile],
+                    resource_pattern: target_str.clone(),
+                    priority: 10,
+                });
+            assert!(engine.add_policy(policy).is_ok());
+            let decision = engine.evaluate(&req);
+            assert_eq!(
+                decision.decision,
+                Decision::Allow,
+                "Exact-path Allow must beat wildcard Deny at equal priority"
+            );
+            assert_eq!(decision.reason.rule_id.as_deref(), Some("r-exact-allow"));
+        }
+
+        // Case B: Exact Deny beats Wildcard Allow at equal priority (10)
+        {
+            let engine = PolicyEngine::new();
+            let policy = Policy::new("p-exact-deny", "Exact Deny vs Wildcard Allow", 1)
+                .with_rule(PolicyRule {
+                    id: "r-wildcard-allow".to_string(),
+                    description: "Allow wildcard".to_string(),
+                    decision: Decision::Allow,
+                    agent_pattern: "*".to_string(),
+                    action_types: vec![ActionType::ReadFile],
+                    resource_pattern: wildcard_str,
+                    priority: 10,
+                })
+                .with_rule(PolicyRule {
+                    id: "r-exact-deny".to_string(),
+                    description: "Deny exact file".to_string(),
+                    decision: Decision::Deny,
+                    agent_pattern: "*".to_string(),
+                    action_types: vec![ActionType::ReadFile],
+                    resource_pattern: target_str,
+                    priority: 10,
+                });
+            assert!(engine.add_policy(policy).is_ok());
+            let decision = engine.evaluate(&req);
+            assert_eq!(
+                decision.decision,
+                Decision::Deny,
+                "Exact-path Deny must beat wildcard Allow at equal priority"
+            );
+            assert_eq!(decision.reason.rule_id.as_deref(), Some("r-exact-deny"));
+        }
     }
 }
 

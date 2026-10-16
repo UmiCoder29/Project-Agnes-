@@ -225,6 +225,8 @@ pub struct Policy {
     pub rules: Vec<PolicyRule>,
 }
 
+use crate::error::PolicyLoadError;
+
 impl Policy {
     pub fn new(id: impl Into<String>, name: impl Into<String>, version: u32) -> Self {
         Self {
@@ -240,10 +242,28 @@ impl Policy {
         self
     }
 
-    /// Parses a Policy from a JSON configuration string.
-    /// Fails safely if the JSON is malformed, missing required fields, or has invalid types.
-    pub fn from_json(json_str: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json_str)
+    /// Validates and resolves all rule patterns in this policy atomically.
+    /// If ANY rule's pattern fails to resolve (e.g. symlink loop, invalid path, null byte,
+    /// leading/trailing whitespace), returns PolicyLoadError naming the policy id, rule id, and reason.
+    pub fn validate_and_resolve_patterns(&mut self) -> Result<(), PolicyLoadError> {
+        for rule in &mut self.rules {
+            if let Err(err) = rule.resolve_pattern() {
+                return Err(PolicyLoadError::InvalidRulePattern {
+                    policy_id: self.id.clone(),
+                    rule_id: rule.id.clone(),
+                    reason: err.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Parses a Policy from a JSON configuration string and validates all rule patterns atomically.
+    /// Fails safely if the JSON is malformed, missing required fields, or if any rule pattern is invalid.
+    pub fn from_json(json_str: &str) -> Result<Self, PolicyLoadError> {
+        let mut policy: Policy = serde_json::from_str(json_str)?;
+        policy.validate_and_resolve_patterns()?;
+        Ok(policy)
     }
 }
 
