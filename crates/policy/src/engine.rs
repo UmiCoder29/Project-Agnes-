@@ -23,8 +23,39 @@ impl PolicyEngine {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        info!(policy_id = %policy.id, policy_name = %policy.name, "Loaded policy into engine");
-        guard.push(policy);
+
+        let mut validated_rules = Vec::new();
+        for mut rule in policy.rules {
+            match rule.resolve_pattern() {
+                Ok(()) => {
+                    validated_rules.push(rule);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        policy_id = %policy.id,
+                        rule_id = %rule.id,
+                        pattern = %rule.resource_pattern,
+                        error = %err,
+                        "Rejecting policy rule with unresolvable pattern at load time (fail-closed)"
+                    );
+                }
+            }
+        }
+
+        let validated_policy = Policy {
+            id: policy.id,
+            name: policy.name,
+            version: policy.version,
+            rules: validated_rules,
+        };
+
+        info!(
+            policy_id = %validated_policy.id,
+            policy_name = %validated_policy.name,
+            rules_count = validated_policy.rules.len(),
+            "Loaded policy into engine"
+        );
+        guard.push(validated_policy);
     }
 
     /// Clears all loaded policies and clears any lock poison flag.
@@ -171,13 +202,23 @@ impl PolicyEngine {
             };
         }
 
-        // Sort rules deterministically:
-        // 1. Priority DESC
-        // 2. Decision: Deny before Allow (Deny has higher precedence on collision)
-        // 3. Rule ID ASC for deterministic tie-break
+        // Deterministic multi-stage rule precedence sort:
+        //
+        // Precedence Order:
+        // 1. Priority DESC: Highest numeric priority wins (explicit administrative override).
+        // 2. Specificity DESC: When priorities are equal, the most-specific match wins:
+        //    - Exact matches (is_exact = true) beat all wildcard/prefix patterns.
+        //    - Deeper directory prefixes (more path components) beat shallower parent directories
+        //      (e.g., an Allow or Deny on /a/b/c/* beats a rule on /a/b/* or /a/*).
+        //    - Longer prefix character lengths break ties between rules with identical component counts.
+        //    - Global wildcard ("*") has lowest specificity (0).
+        // 3. Decision (Deny before Allow): When both priority and specificity are equal (ambiguous conflict),
+        //    the engine fails closed by prioritizing Deny over Allow.
+        // 4. Policy ID ASC, Rule ID ASC: Fully deterministic tie-breaker for identical rules.
         matching_rules.sort_by(|(p_a, r_a), (p_b, r_b)| {
             r_b.priority
                 .cmp(&r_a.priority)
+                .then_with(|| r_b.specificity().cmp(&r_a.specificity()))
                 .then_with(|| {
                     match (r_a.decision, r_b.decision) {
                         (Decision::Deny, Decision::Allow) => std::cmp::Ordering::Less,

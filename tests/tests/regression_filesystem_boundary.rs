@@ -1236,6 +1236,411 @@ fn test_regression_025_symlink_loop_resolves_to_deny() {
     assert_eq!(decision.matched_policy_id, "fail-closed-path-resolution");
 }
 
+// REGRESSION-026: Precedence order for multiple matching rules.
+// When multiple rules match the same path at equal priority:
+// 1. Most-specific match wins (subdirectory beats parent directory).
+// 2. When precedence is ambiguous (equal specificity and priority), Deny wins.
+#[test]
+fn test_regression_026_precedence_most_specific_match_and_deny_on_ambiguity() {
+    let temp = tempdir().expect("tempdir failed");
+    let sandbox_root = temp.path().join("sandbox");
+    let parent_dir = sandbox_root.join("parent");
+    let sub_dir = parent_dir.join("sub");
+    fs::create_dir_all(&sub_dir).expect("mkdir sub");
+
+    let file_in_sub = sub_dir.join("sub_file.txt");
+    fs::write(&file_in_sub, "SUB_DATA").expect("write sub_file");
+
+    let file_in_parent = parent_dir.join("parent_file.txt");
+    fs::write(&file_in_parent, "PARENT_DATA").expect("write parent_file");
+
+    let harness = SecurityTestHarness::new();
+    harness.fs_enforcer.register_sandbox_root(&sandbox_root);
+
+    // Case 1: Deny subdirectory inside Allow parent (equal priority 10)
+    // Most specific rule (sub_dir) must win -> Deny.
+    {
+        harness.policy_engine.clear();
+        let policy = Policy::new("policy-sub-deny", "Sub Deny", 1)
+            .with_rule(PolicyRule {
+                id: "rule-allow-parent".to_string(),
+                description: "Allow parent directory".to_string(),
+                decision: Decision::Allow,
+                agent_pattern: "agent-001".to_string(),
+                action_types: vec![ActionType::ReadFile],
+                resource_pattern: format!("{}/*", parent_dir.display()),
+                priority: 10,
+            })
+            .with_rule(PolicyRule {
+                id: "rule-deny-sub".to_string(),
+                description: "Deny subdirectory".to_string(),
+                decision: Decision::Deny,
+                agent_pattern: "agent-001".to_string(),
+                action_types: vec![ActionType::ReadFile],
+                resource_pattern: format!("{}/*", sub_dir.display()),
+                priority: 10,
+            });
+        harness.policy_engine.add_policy(policy);
+
+        // Read in sub must be Denied because sub_dir is more specific
+        let req_sub = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: file_in_sub.to_str().unwrap().to_string(),
+            },
+        ).with_test_id("REGRESSION-026-SUB-DENY");
+        let report_sub = harness.execute_request(req_sub);
+        assert_eq!(
+            report_sub.decision,
+            Decision::Deny,
+            "Deny subdirectory inside Allow parent must resolve to Deny"
+        );
+        assert_eq!(report_sub.observed_result, ObservedResult::BlockedByFirewall);
+
+        // Read in parent must be Allowed because only parent rule matches
+        let req_parent = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: file_in_parent.to_str().unwrap().to_string(),
+            },
+        ).with_test_id("REGRESSION-026-PARENT-ALLOW");
+        let report_parent = harness.execute_request(req_parent);
+        assert_eq!(
+            report_parent.decision,
+            Decision::Allow,
+            "Read in parent must resolve to Allow"
+        );
+        assert_eq!(report_parent.observed_result, ObservedResult::AccessSuccess);
+    }
+
+    // Case 2: Allow subdirectory inside Deny parent (equal priority 10)
+    // Most specific rule (sub_dir) must win -> Allow.
+    {
+        harness.policy_engine.clear();
+        let policy = Policy::new("policy-sub-allow", "Sub Allow", 1)
+            .with_rule(PolicyRule {
+                id: "rule-deny-parent".to_string(),
+                description: "Deny parent directory".to_string(),
+                decision: Decision::Deny,
+                agent_pattern: "agent-001".to_string(),
+                action_types: vec![ActionType::ReadFile],
+                resource_pattern: format!("{}/*", parent_dir.display()),
+                priority: 10,
+            })
+            .with_rule(PolicyRule {
+                id: "rule-allow-sub".to_string(),
+                description: "Allow subdirectory".to_string(),
+                decision: Decision::Allow,
+                agent_pattern: "agent-001".to_string(),
+                action_types: vec![ActionType::ReadFile],
+                resource_pattern: format!("{}/*", sub_dir.display()),
+                priority: 10,
+            });
+        harness.policy_engine.add_policy(policy);
+
+        // Read in sub must be Allowed because sub_dir rule is more specific than parent rule
+        let req_sub = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: file_in_sub.to_str().unwrap().to_string(),
+            },
+        ).with_test_id("REGRESSION-026-SUB-ALLOW");
+        let report_sub = harness.execute_request(req_sub);
+        assert_eq!(
+            report_sub.decision,
+            Decision::Allow,
+            "Allow subdirectory inside Deny parent must resolve to Allow by specificity"
+        );
+        assert_eq!(report_sub.observed_result, ObservedResult::AccessSuccess);
+
+        // Read in parent must be Denied because parent rule is Deny
+        let req_parent = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: file_in_parent.to_str().unwrap().to_string(),
+            },
+        ).with_test_id("REGRESSION-026-PARENT-DENY");
+        let report_parent = harness.execute_request(req_parent);
+        assert_eq!(
+            report_parent.decision,
+            Decision::Deny,
+            "Read in parent must resolve to Deny"
+        );
+        assert_eq!(report_parent.observed_result, ObservedResult::BlockedByFirewall);
+    }
+
+    // Case 3: Two equally-specific conflicting rules (equal priority 10)
+    // Precedence is ambiguous: Deny must win fail-closed.
+    {
+        harness.policy_engine.clear();
+        let policy = Policy::new("policy-conflict", "Conflict", 1)
+            .with_rule(PolicyRule {
+                id: "rule-allow-sub-conflict".to_string(),
+                description: "Allow sub".to_string(),
+                decision: Decision::Allow,
+                agent_pattern: "agent-001".to_string(),
+                action_types: vec![ActionType::ReadFile],
+                resource_pattern: format!("{}/*", sub_dir.display()),
+                priority: 10,
+            })
+            .with_rule(PolicyRule {
+                id: "rule-deny-sub-conflict".to_string(),
+                description: "Deny sub".to_string(),
+                decision: Decision::Deny,
+                agent_pattern: "agent-001".to_string(),
+                action_types: vec![ActionType::ReadFile],
+                resource_pattern: format!("{}/*", sub_dir.display()),
+                priority: 10,
+            });
+        harness.policy_engine.add_policy(policy);
+
+        let req_sub = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: file_in_sub.to_str().unwrap().to_string(),
+            },
+        ).with_test_id("REGRESSION-026-AMBIGUOUS-DENY");
+        let report_sub = harness.execute_request(req_sub);
+        assert_eq!(
+            report_sub.decision,
+            Decision::Deny,
+            "Equally-specific conflicting rules at equal priority must fail-closed to Deny"
+        );
+        assert_eq!(report_sub.observed_result, ObservedResult::BlockedByFirewall);
+    }
+}
+
+// REGRESSION-027: Symlinked rule patterns.
+// Patterns are resolved to their real canonical location at policy add time (Option 2).
+// 1. A Deny rule written against a symlinked path still applies to the real target.
+// 2. An Allow rule written against a symlinked path does NOT grant access to anything outside the resolved location.
+// 3. A pattern whose symlink is later repointed does NOT silently widen an Allow.
+#[test]
+fn test_regression_027_symlinked_rule_patterns_resolved_at_load_time() {
+    let temp = tempdir().expect("tempdir failed");
+    let sandbox_root = temp.path().join("sandbox");
+    let real_denied = sandbox_root.join("real_denied");
+    let real_allowed = sandbox_root.join("real_allowed");
+    let other_dir = sandbox_root.join("other_dir");
+    let symlinks_dir = sandbox_root.join("symlinks");
+    fs::create_dir_all(&real_denied).expect("mkdir real_denied");
+    fs::create_dir_all(&real_allowed).expect("mkdir real_allowed");
+    fs::create_dir_all(&other_dir).expect("mkdir other_dir");
+    fs::create_dir_all(&symlinks_dir).expect("mkdir symlinks_dir");
+
+    let denied_file = real_denied.join("secret.txt");
+    fs::write(&denied_file, "DENIED_SECRET_DATA").expect("write denied");
+
+    let allowed_file = real_allowed.join("public.txt");
+    fs::write(&allowed_file, "ALLOWED_PUBLIC_DATA").expect("write allowed");
+
+    let other_file = other_dir.join("other.txt");
+    fs::write(&other_file, "OTHER_DATA").expect("write other");
+
+    let symlink_denied = symlinks_dir.join("link_denied");
+    let symlink_allowed = symlinks_dir.join("link_allowed");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&real_denied, &symlink_denied).expect("symlink denied");
+        std::os::unix::fs::symlink(&real_allowed, &symlink_allowed).expect("symlink allowed");
+    }
+
+    let harness = SecurityTestHarness::new();
+    harness.fs_enforcer.register_sandbox_root(&sandbox_root);
+
+    // 1. Deny rule written against a symlinked path still applies to the real target
+    {
+        harness.policy_engine.clear();
+        let policy = Policy::new("p-symlink-deny", "Symlink Deny", 1)
+            .with_rule(PolicyRule {
+                id: "rule-allow-sandbox".to_string(),
+                description: "Allow sandbox".to_string(),
+                decision: Decision::Allow,
+                agent_pattern: "agent-001".to_string(),
+                action_types: vec![ActionType::ReadFile],
+                resource_pattern: format!("{}/*", sandbox_root.display()),
+                priority: 10,
+            })
+            .with_rule(PolicyRule {
+                id: "rule-deny-symlink".to_string(),
+                description: "Deny via symlink".to_string(),
+                decision: Decision::Deny,
+                agent_pattern: "agent-001".to_string(),
+                action_types: vec![ActionType::ReadFile],
+                resource_pattern: format!("{}/*", symlink_denied.display()),
+                priority: 10,
+            });
+        harness.policy_engine.add_policy(policy);
+
+        // Accessing the real target must be Denied
+        let req = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: denied_file.to_str().unwrap().to_string(),
+            },
+        ).with_test_id("REGRESSION-027-DENY-REAL");
+        let report = harness.execute_request(req);
+        assert_eq!(
+            report.decision,
+            Decision::Deny,
+            "Deny rule written against symlinked path must apply to real target"
+        );
+        assert_eq!(report.observed_result, ObservedResult::BlockedByFirewall);
+    }
+
+    // 2. Allow rule written against a symlinked path does NOT grant access to anything outside resolved location
+    {
+        harness.policy_engine.clear();
+        let policy = Policy::new("p-symlink-allow", "Symlink Allow", 1).with_rule(PolicyRule {
+            id: "rule-allow-symlink".to_string(),
+            description: "Allow via symlink".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/*", symlink_allowed.display()),
+            priority: 10,
+        });
+        harness.policy_engine.add_policy(policy);
+
+        // Access to allowed file via real path succeeds
+        let req_allowed = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: allowed_file.to_str().unwrap().to_string(),
+            },
+        ).with_test_id("REGRESSION-027-ALLOW-REAL");
+        let report_allowed = harness.execute_request(req_allowed);
+        assert_eq!(report_allowed.decision, Decision::Allow);
+        assert_eq!(report_allowed.observed_result, ObservedResult::AccessSuccess);
+
+        // Access to other_file (outside resolved location) must be Denied fail-closed
+        let req_outside = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: other_file.to_str().unwrap().to_string(),
+            },
+        ).with_test_id("REGRESSION-027-ALLOW-OUTSIDE");
+        let report_outside = harness.execute_request(req_outside);
+        assert_eq!(
+            report_outside.decision,
+            Decision::Deny,
+            "Allow rule on symlinked path must NOT grant access outside the resolved location"
+        );
+        assert_eq!(report_outside.observed_result, ObservedResult::BlockedByFirewall);
+    }
+
+    // 3. A pattern whose symlink is later repointed does NOT silently widen an Allow
+    {
+        harness.policy_engine.clear();
+        let real_narrow = sandbox_root.join("real_narrow");
+        let real_wide = sandbox_root.join("real_wide");
+        fs::create_dir_all(&real_narrow).expect("mkdir real_narrow");
+        fs::create_dir_all(&real_wide).expect("mkdir real_wide");
+
+        let narrow_file = real_narrow.join("narrow.txt");
+        fs::write(&narrow_file, "NARROW_DATA").expect("write narrow");
+        let wide_file = real_wide.join("wide_secret.txt");
+        fs::write(&wide_file, "WIDE_CONFIDENTIAL_DATA").expect("write wide");
+
+        let symlink_switchable = symlinks_dir.join("link_switchable");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_narrow, &symlink_switchable).expect("symlink narrow");
+
+        // Rule written against symlink pointing to real_narrow
+        let policy = Policy::new("p-switchable", "Switchable", 1).with_rule(PolicyRule {
+            id: "rule-allow-switchable".to_string(),
+            description: "Allow switchable".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/*", symlink_switchable.display()),
+            priority: 10,
+        });
+        harness.policy_engine.add_policy(policy);
+
+        // Initially reading narrow file is Allowed
+        let req_narrow = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: narrow_file.to_str().unwrap().to_string(),
+            },
+        ).with_test_id("REGRESSION-027-NARROW-INIT");
+        let report_narrow = harness.execute_request(req_narrow);
+        assert_eq!(report_narrow.decision, Decision::Allow);
+
+        // Repoint symlink: symlink_switchable now points to real_wide!
+        #[cfg(unix)]
+        {
+            fs::remove_file(&symlink_switchable).expect("remove symlink");
+            std::os::unix::fs::symlink(&real_wide, &symlink_switchable).expect("repoint symlink to wide");
+        }
+
+        // Reading wide_file must still be DENIED because the pattern was resolved and bound at load time!
+        let req_wide = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: wide_file.to_str().unwrap().to_string(),
+            },
+        ).with_test_id("REGRESSION-027-WIDE-DENIED");
+        let report_wide = harness.execute_request(req_wide);
+        assert_eq!(
+            report_wide.decision,
+            Decision::Deny,
+            "Repointing a rule pattern's symlink must NOT silently widen the Allow rule"
+        );
+        assert_eq!(report_wide.observed_result, ObservedResult::BlockedByFirewall);
+    }
+}
+
+// REGRESSION-028: Rule with unresolvable pattern (e.g. symlink loop in pattern) is rejected at load time.
+#[test]
+fn test_regression_028_unresolvable_rule_pattern_rejected_at_load_time() {
+    let temp = tempdir().expect("tempdir failed");
+    let loop_a = temp.path().join("pattern_loop_a");
+    let loop_b = temp.path().join("pattern_loop_b");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&loop_b, &loop_a).expect("symlink a");
+        std::os::unix::fs::symlink(&loop_a, &loop_b).expect("symlink b");
+    }
+
+    let valid_dir = temp.path().join("valid");
+    fs::create_dir_all(&valid_dir).expect("mkdir valid");
+    let valid_file = valid_dir.join("valid.txt");
+    fs::write(&valid_file, "VALID").expect("write valid");
+
+    let harness = SecurityTestHarness::new();
+    harness.fs_enforcer.register_sandbox_root(temp.path());
+
+    // Policy has a rule with a loop in the resource_pattern
+    let policy = Policy::new("p-bad-pattern", "Bad Pattern", 1).with_rule(PolicyRule {
+        id: "rule-bad-loop".to_string(),
+        description: "Rule with symlink loop pattern".to_string(),
+        decision: Decision::Allow,
+        agent_pattern: "agent-001".to_string(),
+        action_types: vec![ActionType::ReadFile],
+        resource_pattern: format!("{}/*", loop_a.display()),
+        priority: 10,
+    });
+    // Add policy: unresolvable rule must be rejected at load time
+    harness.policy_engine.add_policy(policy);
+
+    // Request should receive default Deny because the bad rule was rejected
+    let req = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: valid_file.to_str().unwrap().to_string(),
+        },
+    ).with_test_id("REGRESSION-028-REJECTED-RULE");
+    let report = harness.execute_request(req);
+    assert_eq!(
+        report.decision,
+        Decision::Deny,
+        "Policy with unresolvable rule pattern must fail-closed to Deny"
+    );
+}
+
+
 
 
 
