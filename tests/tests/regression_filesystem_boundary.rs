@@ -2066,6 +2066,510 @@ fn test_regression_029_adversarial_last_rule_invalid_proves_no_partial_load() {
     assert_eq!(report2.policy, "default-fail-closed");
 }
 
+// REGRESSION-030: Path normalization edge cases in policy engine rule matching.
+// Verifies that trailing slashes, repeated slashes, and `.` segments cannot be used
+// to make a path look different from its canonical form at rule-matching time.
+
+#[test]
+fn test_regression_030_exact_rule_trailing_and_repeated_slashes_match_clean_form() {
+    let temp = tempdir().expect("tempdir failed");
+    let sandbox_root = temp.path().join("sandbox");
+    fs::create_dir_all(&sandbox_root).expect("mkdir sandbox");
+
+    let target_file = sandbox_root.join("data.txt");
+    fs::write(&target_file, "AUTHORIZED_PAYLOAD").expect("write data");
+
+    let harness = SecurityTestHarness::new();
+    harness.fs_enforcer.register_sandbox_root(&sandbox_root);
+
+    let clean_path = target_file.to_str().unwrap().to_string();
+
+    // Exact-path rule matching target_file
+    let policy = Policy::new("p-exact-normalize", "Exact Path Normalization", 1)
+        .with_rule(PolicyRule {
+            id: "rule-allow-data-exact".to_string(),
+            description: "Allow exact data file".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: clean_path.clone(),
+            priority: 10,
+        });
+
+    harness.policy_engine.add_policy(policy).expect("load policy");
+
+    // 1. Clean form
+    let req_clean = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: clean_path.clone(),
+        },
+    ).with_test_id("REGRESSION-030-CLEAN");
+    let eval_clean = harness.policy_engine.evaluate(&req_clean);
+    assert_eq!(eval_clean.decision, Decision::Allow);
+    assert_eq!(eval_clean.matched_policy_id, "p-exact-normalize");
+    assert_eq!(eval_clean.reason.rule_id.as_deref(), Some("rule-allow-data-exact"));
+
+    // 2. Trailing slash variant on file
+    let req_trailing = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: format!("{}/", clean_path),
+        },
+    ).with_test_id("REGRESSION-030-TRAILING-SLASH");
+    let eval_trailing = harness.policy_engine.evaluate(&req_trailing);
+    assert_eq!(
+        eval_trailing.decision,
+        Decision::Allow,
+        "Trailing slash variant must match the exact same rule as clean form"
+    );
+    assert_eq!(eval_trailing.matched_policy_id, "p-exact-normalize");
+    assert_eq!(eval_trailing.reason.rule_id.as_deref(), Some("rule-allow-data-exact"));
+    assert_eq!(eval_trailing.resolved_resource, eval_clean.resolved_resource);
+
+    // 3. Multiple trailing slashes variant
+    let req_multi_trailing = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: format!("{}///", clean_path),
+        },
+    ).with_test_id("REGRESSION-030-MULTI-TRAILING");
+    let eval_multi_trailing = harness.policy_engine.evaluate(&req_multi_trailing);
+    assert_eq!(eval_multi_trailing.decision, Decision::Allow);
+    assert_eq!(eval_multi_trailing.matched_policy_id, "p-exact-normalize");
+    assert_eq!(eval_multi_trailing.reason.rule_id.as_deref(), Some("rule-allow-data-exact"));
+    assert_eq!(eval_multi_trailing.resolved_resource, eval_clean.resolved_resource);
+
+    // 4. Repeated slashes variant
+    let repeated_slash_path = format!("{}///data.txt", sandbox_root.display());
+    let req_rep = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: repeated_slash_path,
+        },
+    ).with_test_id("REGRESSION-030-REPEATED-SLASH");
+    let eval_rep = harness.policy_engine.evaluate(&req_rep);
+    assert_eq!(
+        eval_rep.decision,
+        Decision::Allow,
+        "Repeated slash variant must match the exact same rule as clean form"
+    );
+    assert_eq!(eval_rep.matched_policy_id, "p-exact-normalize");
+    assert_eq!(eval_rep.reason.rule_id.as_deref(), Some("rule-allow-data-exact"));
+    assert_eq!(eval_rep.resolved_resource, eval_clean.resolved_resource);
+
+    // 5. Dot segments variant
+    let dot_segment_path = format!("{}/./data.txt", sandbox_root.display());
+    let req_dot = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: dot_segment_path,
+        },
+    ).with_test_id("REGRESSION-030-DOT-SEGMENT");
+    let eval_dot = harness.policy_engine.evaluate(&req_dot);
+    assert_eq!(eval_dot.decision, Decision::Allow);
+    assert_eq!(eval_dot.matched_policy_id, "p-exact-normalize");
+    assert_eq!(eval_dot.reason.rule_id.as_deref(), Some("rule-allow-data-exact"));
+    assert_eq!(eval_dot.resolved_resource, eval_clean.resolved_resource);
+
+    // 6. Combined variant (multiple leading slashes, dot segments, repeated slashes, trailing slash)
+    let combined_path = format!("///{}///./data.txt///", sandbox_root.display().to_string().trim_start_matches('/'));
+    let req_comb = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: combined_path,
+        },
+    ).with_test_id("REGRESSION-030-COMBINED");
+    let eval_comb = harness.policy_engine.evaluate(&req_comb);
+    assert_eq!(eval_comb.decision, Decision::Allow);
+    assert_eq!(eval_comb.matched_policy_id, "p-exact-normalize");
+    assert_eq!(eval_comb.reason.rule_id.as_deref(), Some("rule-allow-data-exact"));
+    assert_eq!(eval_comb.resolved_resource, eval_clean.resolved_resource);
+}
+
+#[test]
+fn test_regression_030_prefix_rule_trailing_and_repeated_slashes_match_clean_form() {
+    let temp = tempdir().expect("tempdir failed");
+    let sandbox_root = temp.path().join("sandbox");
+    let public_dir = sandbox_root.join("public");
+    let sub_dir = public_dir.join("sub");
+    fs::create_dir_all(&sub_dir).expect("mkdir sub");
+
+    let file_in_sub = sub_dir.join("nested.txt");
+    fs::write(&file_in_sub, "NESTED_PUBLIC_DATA").expect("write nested");
+
+    let harness = SecurityTestHarness::new();
+    harness.fs_enforcer.register_sandbox_root(&sandbox_root);
+
+    // Prefix rule for public directory
+    let policy = Policy::new("p-prefix-normalize", "Prefix Normalization", 1)
+        .with_rule(PolicyRule {
+            id: "rule-allow-public-prefix".to_string(),
+            description: "Allow all under public".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/*", public_dir.display()),
+            priority: 10,
+        });
+
+    harness.policy_engine.add_policy(policy).expect("load policy");
+
+    let clean_file_path = file_in_sub.to_str().unwrap().to_string();
+
+    // 1. Clean file path
+    let req_clean = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: clean_file_path.clone(),
+        },
+    ).with_test_id("REGRESSION-030-PREFIX-CLEAN");
+    let eval_clean = harness.policy_engine.evaluate(&req_clean);
+    assert_eq!(eval_clean.decision, Decision::Allow);
+    assert_eq!(eval_clean.matched_policy_id, "p-prefix-normalize");
+    assert_eq!(eval_clean.reason.rule_id.as_deref(), Some("rule-allow-public-prefix"));
+
+    // 2. Trailing slash on file under prefix
+    let req_trailing_file = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: format!("{}/", clean_file_path),
+        },
+    ).with_test_id("REGRESSION-030-PREFIX-TRAILING-FILE");
+    let eval_trailing_file = harness.policy_engine.evaluate(&req_trailing_file);
+    assert_eq!(eval_trailing_file.decision, Decision::Allow);
+    assert_eq!(eval_trailing_file.matched_policy_id, "p-prefix-normalize");
+    assert_eq!(eval_trailing_file.reason.rule_id.as_deref(), Some("rule-allow-public-prefix"));
+    assert_eq!(eval_trailing_file.resolved_resource, eval_clean.resolved_resource);
+
+    // 3. Repeated slashes in file path under prefix
+    let rep_file_path = format!("{}///sub////nested.txt", public_dir.display());
+    let req_rep_file = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: rep_file_path,
+        },
+    ).with_test_id("REGRESSION-030-PREFIX-REP-FILE");
+    let eval_rep_file = harness.policy_engine.evaluate(&req_rep_file);
+    assert_eq!(eval_rep_file.decision, Decision::Allow);
+    assert_eq!(eval_rep_file.matched_policy_id, "p-prefix-normalize");
+    assert_eq!(eval_rep_file.reason.rule_id.as_deref(), Some("rule-allow-public-prefix"));
+    assert_eq!(eval_rep_file.resolved_resource, eval_clean.resolved_resource);
+
+    // 4. Directory target clean form vs trailing slash variants
+    let clean_dir_path = sub_dir.to_str().unwrap().to_string();
+    let req_clean_dir = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: clean_dir_path.clone(),
+        },
+    ).with_test_id("REGRESSION-030-DIR-CLEAN");
+    let eval_clean_dir = harness.policy_engine.evaluate(&req_clean_dir);
+    assert_eq!(eval_clean_dir.decision, Decision::Allow);
+    assert_eq!(eval_clean_dir.reason.rule_id.as_deref(), Some("rule-allow-public-prefix"));
+
+    let req_trailing_dir = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: format!("{}/", clean_dir_path),
+        },
+    ).with_test_id("REGRESSION-030-DIR-TRAILING");
+    let eval_trailing_dir = harness.policy_engine.evaluate(&req_trailing_dir);
+    assert_eq!(
+        eval_trailing_dir.decision,
+        Decision::Allow,
+        "Directory path with trailing slash must match identical prefix rule"
+    );
+    assert_eq!(eval_trailing_dir.reason.rule_id.as_deref(), Some("rule-allow-public-prefix"));
+    assert_eq!(eval_trailing_dir.resolved_resource, eval_clean_dir.resolved_resource);
+
+    let req_multi_slash_dir = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: format!("{}///sub///", public_dir.display()),
+        },
+    ).with_test_id("REGRESSION-030-DIR-MULTI-SLASH");
+    let eval_multi_slash_dir = harness.policy_engine.evaluate(&req_multi_slash_dir);
+    assert_eq!(eval_multi_slash_dir.decision, Decision::Allow);
+    assert_eq!(eval_multi_slash_dir.reason.rule_id.as_deref(), Some("rule-allow-public-prefix"));
+    assert_eq!(eval_multi_slash_dir.resolved_resource, eval_clean_dir.resolved_resource);
+}
+
+#[test]
+fn test_regression_030_deny_rule_cannot_be_bypassed_via_slashes_or_dots() {
+    let temp = tempdir().expect("tempdir failed");
+    let sandbox_root = temp.path().join("sandbox");
+    let secret_dir = sandbox_root.join("secret");
+    fs::create_dir_all(&secret_dir).expect("mkdir secret");
+
+    let secret_file = secret_dir.join("passwords.txt");
+    fs::write(&secret_file, "CONFIDENTIAL_KEY").expect("write secret");
+
+    let exact_secret = sandbox_root.join("exact_secret.txt");
+    fs::write(&exact_secret, "CONFIDENTIAL_EXACT").expect("write exact secret");
+
+    let harness = SecurityTestHarness::new();
+    harness.fs_enforcer.register_sandbox_root(&sandbox_root);
+
+    // Policy: Allow all under sandbox at priority 10, but Deny secret at priority 100
+    let policy = Policy::new("p-deny-bypass-test", "Deny Bypass Normalization Test", 1)
+        .with_rule(PolicyRule {
+            id: "rule-allow-sandbox".to_string(),
+            description: "Allow sandbox root".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/*", sandbox_root.display()),
+            priority: 10,
+        })
+        .with_rule(PolicyRule {
+            id: "rule-deny-secret-prefix".to_string(),
+            description: "Deny secret prefix".to_string(),
+            decision: Decision::Deny,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/*", secret_dir.display()),
+            priority: 100,
+        })
+        .with_rule(PolicyRule {
+            id: "rule-deny-exact-file".to_string(),
+            description: "Deny exact secret file".to_string(),
+            decision: Decision::Deny,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: exact_secret.to_str().unwrap().to_string(),
+            priority: 100,
+        });
+
+    harness.policy_engine.add_policy(policy).expect("load policy");
+
+    let clean_secret_path = secret_file.to_str().unwrap().to_string();
+
+    // 1. Clean form targeting prefix-denied resource
+    let req_clean = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: clean_secret_path.clone(),
+        },
+    ).with_test_id("REGRESSION-030-DENY-CLEAN");
+    let eval_clean = harness.policy_engine.evaluate(&req_clean);
+    assert_eq!(eval_clean.decision, Decision::Deny);
+    assert_eq!(eval_clean.reason.rule_id.as_deref(), Some("rule-deny-secret-prefix"));
+
+    // 2. Trailing slash attempt against prefix-denied resource
+    let req_trailing = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: format!("{}/", clean_secret_path),
+        },
+    ).with_test_id("REGRESSION-030-DENY-TRAILING");
+    let eval_trailing = harness.policy_engine.evaluate(&req_trailing);
+    assert_eq!(
+        eval_trailing.decision,
+        Decision::Deny,
+        "Trailing slash variant must NOT bypass prefix Deny rule!"
+    );
+    assert_eq!(eval_trailing.reason.rule_id.as_deref(), Some("rule-deny-secret-prefix"));
+
+    // 3. Repeated slashes attempt against prefix-denied resource
+    let rep_secret_path = format!("{}///secret////passwords.txt", sandbox_root.display());
+    let req_rep = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: rep_secret_path,
+        },
+    ).with_test_id("REGRESSION-030-DENY-REPEATED");
+    let eval_rep = harness.policy_engine.evaluate(&req_rep);
+    assert_eq!(
+        eval_rep.decision,
+        Decision::Deny,
+        "Repeated slash variant must NOT bypass prefix Deny rule!"
+    );
+    assert_eq!(eval_rep.reason.rule_id.as_deref(), Some("rule-deny-secret-prefix"));
+
+    // 4. Dot segments attempt against prefix-denied resource
+    let dot_secret_path = format!("{}/./secret/./passwords.txt", sandbox_root.display());
+    let req_dot = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: dot_secret_path,
+        },
+    ).with_test_id("REGRESSION-030-DENY-DOT");
+    let eval_dot = harness.policy_engine.evaluate(&req_dot);
+    assert_eq!(
+        eval_dot.decision,
+        Decision::Deny,
+        "Dot segment variant must NOT bypass prefix Deny rule!"
+    );
+    assert_eq!(eval_dot.reason.rule_id.as_deref(), Some("rule-deny-secret-prefix"));
+
+    // 5. Combined attempt against exact-denied file
+    let clean_exact_path = exact_secret.to_str().unwrap().to_string();
+    let comb_exact_path = format!("{}///./exact_secret.txt///", sandbox_root.display());
+    let req_comb_exact = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: comb_exact_path,
+        },
+    ).with_test_id("REGRESSION-030-DENY-EXACT-COMBINED");
+    let eval_comb_exact = harness.policy_engine.evaluate(&req_comb_exact);
+    assert_eq!(
+        eval_comb_exact.decision,
+        Decision::Deny,
+        "Combined slash/dot variant must NOT bypass exact Deny rule!"
+    );
+    assert_eq!(eval_comb_exact.reason.rule_id.as_deref(), Some("rule-deny-exact-file"));
+
+    let eval_clean_exact = harness.policy_engine.evaluate(&ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: clean_exact_path,
+        },
+    ));
+    assert_eq!(eval_comb_exact.resolved_resource, eval_clean_exact.resolved_resource);
+}
+
+#[test]
+fn test_regression_030_rule_patterns_with_redundant_slashes_match_clean_requests() {
+    let temp = tempdir().expect("tempdir failed");
+    let sandbox_root = temp.path().join("sandbox");
+    let public_dir = sandbox_root.join("public");
+    let sub_dir = public_dir.join("sub");
+    fs::create_dir_all(&sub_dir).expect("mkdir sub");
+
+    let test_file = public_dir.join("test.txt");
+    fs::write(&test_file, "DATA").expect("write test");
+
+    let harness = SecurityTestHarness::new();
+    harness.fs_enforcer.register_sandbox_root(&sandbox_root);
+
+    // Rule patterns defined with redundant slashes:
+    // 1. Prefix rule with repeated slashes and trailing slashes before wildcard: "///sandbox///public///*"
+    // 2. Exact directory rule with trailing slash: "/sandbox/public/sub/"
+    let pattern_with_slashes = format!("///{}///public///*", sandbox_root.display().to_string().trim_start_matches('/'));
+    let exact_dir_trailing = format!("{}/", sub_dir.display());
+
+    let policy = Policy::new("p-pattern-slashes", "Redundant Slashes in Pattern", 1)
+        .with_rule(PolicyRule {
+            id: "rule-prefix-slashes".to_string(),
+            description: "Prefix rule with redundant slashes".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: pattern_with_slashes,
+            priority: 10,
+        })
+        .with_rule(PolicyRule {
+            id: "rule-exact-dir-trailing".to_string(),
+            description: "Exact directory with trailing slash".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: exact_dir_trailing,
+            priority: 20,
+        });
+
+    assert!(
+        harness.policy_engine.add_policy(policy).is_ok(),
+        "Policy rules with redundant slashes must be canonicalized and successfully loaded"
+    );
+
+    // Clean request matches rule defined with redundant slashes
+    let req_file = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: test_file.to_str().unwrap().to_string(),
+        },
+    ).with_test_id("REGRESSION-030-CLEAN-REQ-MATCHES-SLASH-PATTERN");
+    let eval_file = harness.policy_engine.evaluate(&req_file);
+    assert_eq!(eval_file.decision, Decision::Allow);
+    assert_eq!(eval_file.reason.rule_id.as_deref(), Some("rule-prefix-slashes"));
+
+    // Clean directory request matches exact directory rule defined with trailing slash
+    let req_dir = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: sub_dir.to_str().unwrap().to_string(),
+        },
+    ).with_test_id("REGRESSION-030-CLEAN-DIR-MATCHES-TRAILING-SLASH-PATTERN");
+    let eval_dir = harness.policy_engine.evaluate(&req_dir);
+    assert_eq!(eval_dir.decision, Decision::Allow);
+    assert_eq!(eval_dir.reason.rule_id.as_deref(), Some("rule-exact-dir-trailing"));
+}
+
+#[test]
+fn test_regression_030_non_existent_file_normalization_variants_match_same_rule() {
+    let temp = tempdir().expect("tempdir failed");
+    let sandbox_root = temp.path().join("sandbox");
+    let write_dir = sandbox_root.join("output");
+    fs::create_dir_all(&write_dir).expect("mkdir output");
+
+    let harness = SecurityTestHarness::new();
+    harness.fs_enforcer.register_sandbox_root(&sandbox_root);
+
+    let policy = Policy::new("p-write-normalize", "Write Normalization", 1)
+        .with_rule(PolicyRule {
+            id: "rule-allow-write".to_string(),
+            description: "Allow write to output".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::WriteFile],
+            resource_pattern: format!("{}/*", write_dir.display()),
+            priority: 10,
+        });
+
+    harness.policy_engine.add_policy(policy).expect("load policy");
+
+    let clean_non_existent = format!("{}/new_report.txt", write_dir.display());
+    let rep_non_existent = format!("{}///output////new_report.txt", sandbox_root.display());
+    let dot_non_existent = format!("{}/./output/./new_report.txt", sandbox_root.display());
+    let trailing_non_existent = format!("{}/new_report.txt/", write_dir.display());
+
+    let eval_clean = harness.policy_engine.evaluate(&ActionRequest::new(
+        "agent-001",
+        ActionPayload::WriteFile {
+            path: clean_non_existent.clone(),
+            content: "REPORT".to_string(),
+        },
+    ));
+    assert_eq!(eval_clean.decision, Decision::Allow);
+    assert_eq!(eval_clean.reason.rule_id.as_deref(), Some("rule-allow-write"));
+
+    let eval_rep = harness.policy_engine.evaluate(&ActionRequest::new(
+        "agent-001",
+        ActionPayload::WriteFile {
+            path: rep_non_existent,
+            content: "REPORT".to_string(),
+        },
+    ));
+    assert_eq!(eval_rep.decision, Decision::Allow);
+    assert_eq!(eval_rep.reason.rule_id.as_deref(), Some("rule-allow-write"));
+    assert_eq!(eval_rep.resolved_resource, eval_clean.resolved_resource);
+
+    let eval_dot = harness.policy_engine.evaluate(&ActionRequest::new(
+        "agent-001",
+        ActionPayload::WriteFile {
+            path: dot_non_existent,
+            content: "REPORT".to_string(),
+        },
+    ));
+    assert_eq!(eval_dot.decision, Decision::Allow);
+    assert_eq!(eval_dot.reason.rule_id.as_deref(), Some("rule-allow-write"));
+    assert_eq!(eval_dot.resolved_resource, eval_clean.resolved_resource);
+
+    let eval_trailing = harness.policy_engine.evaluate(&ActionRequest::new(
+        "agent-001",
+        ActionPayload::WriteFile {
+            path: trailing_non_existent,
+            content: "REPORT".to_string(),
+        },
+    ));
+    assert_eq!(eval_trailing.decision, Decision::Allow);
+    assert_eq!(eval_trailing.reason.rule_id.as_deref(), Some("rule-allow-write"));
+    assert_eq!(eval_trailing.resolved_resource, eval_clean.resolved_resource);
+}
+
+
 
 
 

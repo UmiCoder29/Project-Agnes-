@@ -256,4 +256,59 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert_eq!(err.to_string(), "Null byte in path");
     }
+
+    #[test]
+    fn test_path_normalization_trailing_and_repeated_slashes() {
+        let temp = tempfile::tempdir().unwrap();
+        let test_dir = temp.path().join("sub_dir");
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let test_file = test_dir.join("test_file.txt");
+        std::fs::write(&test_file, "DATA").unwrap();
+
+        let clean_file = test_file.to_str().unwrap();
+        let clean_dir = test_dir.to_str().unwrap();
+
+        let resolved_clean_file = resolve_real_path(clean_file).unwrap();
+        let resolved_clean_dir = resolve_real_path(clean_dir).unwrap();
+
+        // 1. Repeated slashes in file path
+        let repeated_slash_file = format!("{}///sub_dir//test_file.txt", temp.path().display());
+        let resolved_rep_file = resolve_real_path(&repeated_slash_file).unwrap();
+        assert_eq!(resolved_rep_file, resolved_clean_file);
+
+        // 2. Dot segments in file path
+        let dot_segment_file = format!("{}/./sub_dir/./test_file.txt", temp.path().display());
+        let resolved_dot_file = resolve_real_path(&dot_segment_file).unwrap();
+        assert_eq!(resolved_dot_file, resolved_clean_file);
+
+        // 3. Repeated slashes in directory path
+        let repeated_slash_dir = format!("{}///sub_dir//", temp.path().display());
+        let resolved_rep_dir = resolve_real_path(&repeated_slash_dir).unwrap();
+        assert_eq!(resolved_rep_dir, resolved_clean_dir);
+
+        // 4. Trailing slash on directory path
+        let trailing_slash_dir = format!("{}/", clean_dir);
+        let resolved_trailing_dir = resolve_real_path(&trailing_slash_dir).unwrap();
+        assert_eq!(resolved_trailing_dir, resolved_clean_dir);
+
+        // 5. Trailing slash on regular file
+        let trailing_slash_file = format!("{}/", clean_file);
+        let resolved_trailing_file = resolve_real_path(&trailing_slash_file).unwrap();
+        assert_eq!(resolved_trailing_file, resolved_clean_file);
+
+        // 6. Non-existent file variants (WriteFile target)
+        let non_existent_clean = format!("{}/non_existent.txt", clean_dir);
+        let non_existent_rep = format!("{}///sub_dir////non_existent.txt", temp.path().display());
+        let non_existent_dot = format!("{}/./sub_dir/./non_existent.txt", temp.path().display());
+        let non_existent_slash = format!("{}/non_existent.txt/", clean_dir);
+
+        let res_clean = resolve_real_path(&non_existent_clean).unwrap();
+        let res_rep = resolve_real_path(&non_existent_rep).unwrap();
+        let res_dot = resolve_real_path(&non_existent_dot).unwrap();
+        let res_slash = resolve_real_path(&non_existent_slash).unwrap();
+
+        assert_eq!(res_rep, res_clean);
+        assert_eq!(res_dot, res_clean);
+        assert_eq!(res_slash, res_clean);
+    }
 }
