@@ -28,8 +28,26 @@ impl StateEngine {
     }
 
     pub fn record_event(&self, event: SecurityEvent) {
-        let mut hist = self.history.write().expect("lock poisoned");
-        let mut sess = self.sessions.write().expect("lock poisoned");
+        // Safe to recover via into_inner(): `history` is an append-only audit event buffer;
+        // no security or authorization decision depends on it, and preserving audit event logging
+        // after a thread panic is critical for post-incident observability.
+        let mut hist = match self.history.write() {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!("Recovering poisoned history write lock in StateEngine");
+                e.into_inner()
+            }
+        };
+
+        // Safe to recover via into_inner(): `sessions` tracks informational agent activity counts
+        // for monitoring/telemetry; no authorization or policy decision depends on this state.
+        let mut sess = match self.sessions.write() {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!("Recovering poisoned sessions write lock in StateEngine");
+                e.into_inner()
+            }
+        };
 
         let session = sess.entry(event.agent_id.clone()).or_insert_with(|| AgentSession {
             agent_id: event.agent_id.clone(),
@@ -49,17 +67,29 @@ impl StateEngine {
     }
 
     pub fn get_history(&self, agent_id: &str) -> Vec<SecurityEvent> {
-        let hist = self.history.read().expect("lock poisoned");
+        // Safe to recover via into_inner(): read-only query of append-only audit history for telemetry.
+        let hist = match self.history.read() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
         hist.iter().filter(|e| e.agent_id == agent_id).cloned().collect()
     }
 
     pub fn get_all_events(&self) -> Vec<SecurityEvent> {
-        let hist = self.history.read().expect("lock poisoned");
+        // Safe to recover via into_inner(): read-only query of append-only audit history for telemetry.
+        let hist = match self.history.read() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
         hist.clone()
     }
 
     pub fn get_session(&self, agent_id: &str) -> Option<AgentSession> {
-        let sess = self.sessions.read().expect("lock poisoned");
+        // Safe to recover via into_inner(): read-only query of session activity counts for telemetry.
+        let sess = match self.sessions.read() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
         sess.get(agent_id).cloned()
     }
 }

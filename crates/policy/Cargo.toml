@@ -16,3 +16,7 @@ serde_json.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+agnes-policy = { path = ".", features = ["test-hooks"] }
+

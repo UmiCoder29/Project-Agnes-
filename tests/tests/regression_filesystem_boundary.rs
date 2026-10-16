@@ -1078,6 +1078,122 @@ fn test_regression_022_evaluation_panic_fails_closed_to_deny() {
     assert_eq!(report.observed_result, ObservedResult::BlockedByFirewall);
 }
 
+// REGRESSION-023: Non-atomic config load preserves valid policies when load fails.
+#[test]
+fn test_regression_023_non_atomic_config_load_preserves_valid_policies() {
+    let harness = SecurityTestHarness::new();
+    let valid_json = r#"{
+        "id": "policy-valid",
+        "name": "Valid Policy",
+        "version": 1,
+        "rules": [{
+            "id": "rule-allow-valid",
+            "description": "Allow read",
+            "decision": "ALLOW",
+            "agent_pattern": "*",
+            "action_types": ["READ_FILE"],
+            "resource_pattern": "*",
+            "priority": 10
+        }]
+    }"#;
+
+    assert!(harness.policy_engine.load_policy_from_json(valid_json).is_ok());
+
+    let req = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: "/sandbox/file.txt".to_string(),
+        },
+    ).with_test_id("REGRESSION-023-ATOMIC-LOAD");
+
+    assert_eq!(harness.policy_engine.evaluate(&req).decision, Decision::Allow);
+
+    // Attempting invalid load leaves valid policy active
+    let invalid_json = r#"{"id": "bad", "rules": [ INVALID_JSON"#;
+    assert!(harness.policy_engine.load_policy_from_json(invalid_json).is_err());
+
+    let decision = harness.policy_engine.evaluate(&req);
+    assert_eq!(decision.decision, Decision::Allow);
+    assert_eq!(decision.matched_policy_id, "policy-valid");
+}
+
+// REGRESSION-024: Adversarial empty patterns and invalid path inputs resolve to Deny.
+#[test]
+fn test_regression_024_adversarial_empty_patterns_and_invalid_paths_denied() {
+    let harness = SecurityTestHarness::new();
+
+    // 1. Empty agent_pattern
+    harness.policy_engine.add_policy(
+        Policy::new("p1", "p", 1).with_rule(PolicyRule {
+            id: "r1".to_string(),
+            description: "r".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "*".to_string(),
+            priority: 10,
+        })
+    );
+    let req = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: "/sandbox/file.txt".to_string(),
+        },
+    );
+    assert_eq!(harness.policy_engine.evaluate(&req).decision, Decision::Deny);
+
+    // 2. Empty action_types
+    harness.policy_engine.clear();
+    harness.policy_engine.add_policy(
+        Policy::new("p2", "p", 1).with_rule(PolicyRule {
+            id: "r2".to_string(),
+            description: "r".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![],
+            resource_pattern: "*".to_string(),
+            priority: 10,
+        })
+    );
+    assert_eq!(harness.policy_engine.evaluate(&req).decision, Decision::Deny);
+
+    // 3. Empty resource_pattern
+    harness.policy_engine.clear();
+    harness.policy_engine.add_policy(
+        Policy::new("p3", "p", 1).with_rule(PolicyRule {
+            id: "r3".to_string(),
+            description: "r".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "".to_string(),
+            priority: 10,
+        })
+    );
+    assert_eq!(harness.policy_engine.evaluate(&req).decision, Decision::Deny);
+
+    // 4. Unresolvable path with null byte under allow-all
+    harness.policy_engine.clear();
+    harness.policy_engine.add_policy(
+        Policy::new("p4", "p", 1).with_rule(PolicyRule {
+            id: "r4".to_string(),
+            description: "r".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "*".to_string(),
+            priority: 10,
+        })
+    );
+    let req_null = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: "/sandbox/null\0byte.txt".to_string(),
+        },
+    );
+    assert_eq!(harness.policy_engine.evaluate(&req_null).decision, Decision::Deny);
+}
+
 
 
 

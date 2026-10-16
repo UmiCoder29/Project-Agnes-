@@ -32,14 +32,28 @@ impl InMemoryTelemetrySink {
     }
 
     pub fn events(&self) -> Vec<SecurityEvent> {
-        self.events.read().expect("lock poisoned").clone()
+        // Safe to recover via into_inner(): `events` is an in-memory audit log for testing and telemetry.
+        // Reading existing events after a thread panic preserves observational visibility.
+        let guard = match self.events.read() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        guard.clone()
     }
 }
 
 #[async_trait]
 impl TelemetrySink for InMemoryTelemetrySink {
     async fn record_event(&self, event: &SecurityEvent) -> Result<(), String> {
-        let mut guard = self.events.write().expect("lock poisoned");
+        // Safe to recover via into_inner(): append-only telemetry buffer; no authorization decision depends
+        // on telemetry events, and continuing to record security telemetry after a thread panic is safe.
+        let mut guard = match self.events.write() {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!("Recovering poisoned events write lock in InMemoryTelemetrySink");
+                e.into_inner()
+            }
+        };
         guard.push(event.clone());
         Ok(())
     }

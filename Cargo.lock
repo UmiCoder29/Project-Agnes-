@@ -54,6 +54,7 @@ name = "agnes-policy"
 version = "0.1.0"
 dependencies = [
  "agnes-common",
+ "agnes-policy",
  "chrono",
  "serde",
  "serde_json",

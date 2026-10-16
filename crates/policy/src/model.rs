@@ -33,13 +33,16 @@ impl PolicyRule {
     }
 
     pub fn matches_target(&self, request: &ActionRequest, target: &str) -> bool {
-        // 1. Agent match
+        // 1. Agent match: empty pattern matches nothing (fail-closed)
+        if self.agent_pattern.is_empty() {
+            return false;
+        }
         if self.agent_pattern != "*" && self.agent_pattern != request.agent_id {
             return false;
         }
 
-        // 2. Action type match
-        if !self.action_types.is_empty() && !self.action_types.contains(&request.action_type) {
+        // 2. Action type match: empty action_types list matches nothing (fail-closed)
+        if self.action_types.is_empty() || !self.action_types.contains(&request.action_type) {
             return false;
         }
 
@@ -48,25 +51,38 @@ impl PolicyRule {
             return false;
         }
 
-        // 3. Resource pattern match (target is already resolved exactly once by PolicyEngine::evaluate)
+        // 3. Resource pattern match: empty pattern matches nothing (fail-closed)
+        if self.resource_pattern.is_empty() {
+            return false;
+        }
+
+        // 4. Resource pattern match (target is already resolved exactly once by PolicyEngine::evaluate)
         self.matches_resource(target)
     }
 
     pub fn matches_resource(&self, target: &str) -> bool {
+        if self.resource_pattern.is_empty() {
+            return false;
+        }
+
         if self.resource_pattern == "*" {
             return true;
         }
 
         if let Some(prefix) = self.resource_pattern.strip_suffix("/*") {
             let prefix = prefix.trim_end_matches('/');
-            if target.starts_with(prefix) && (target.len() == prefix.len() || target[prefix.len()..].starts_with('/')) {
-                return true;
+            if let Some(rest) = target.strip_prefix(prefix) {
+                if rest.is_empty() || rest.starts_with('/') {
+                    return true;
+                }
             }
             if let Ok(canon_prefix) = resolve_real_path(prefix) {
                 let canon_str = canon_prefix.to_string_lossy();
                 let canon_str = canon_str.trim_end_matches('/');
-                if target.starts_with(canon_str) && (target.len() == canon_str.len() || target[canon_str.len()..].starts_with('/')) {
-                    return true;
+                if let Some(rest) = target.strip_prefix(canon_str) {
+                    if rest.is_empty() || rest.starts_with('/') {
+                        return true;
+                    }
                 }
             }
             return false;

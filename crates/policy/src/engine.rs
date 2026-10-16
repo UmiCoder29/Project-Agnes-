@@ -27,19 +27,23 @@ impl PolicyEngine {
         guard.push(policy);
     }
 
+    /// Clears all loaded policies and clears any lock poison flag.
+    /// In Rust 1.77+, `RwLock::clear_poison` allows an operator or recovery routine
+    /// to explicitly reset the policy engine to an unpoisoned, known-good state.
     pub fn clear(&self) {
         let mut guard = match self.policies.write() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
         guard.clear();
+        self.policies.clear_poison();
     }
 
     /// Loads and registers a policy from a JSON configuration string.
-    /// Fails safely on any parsing error, ensuring malformed configurations
-    /// never enter the policy engine.
+    /// Uses Policy::from_json as the single canonical parsing entrypoint.
+    /// If parsing fails, the previously loaded policy set is left completely unmodified (atomic).
     pub fn load_policy_from_json(&self, json_str: &str) -> Result<(), serde_json::Error> {
-        let policy: Policy = serde_json::from_str(json_str)?;
+        let policy = Policy::from_json(json_str)?;
         self.add_policy(policy);
         Ok(())
     }
@@ -185,7 +189,27 @@ impl PolicyEngine {
                 .then_with(|| r_a.id.cmp(&r_b.id))
         });
 
-        let (chosen_policy, chosen_rule) = matching_rules[0];
+        let (chosen_policy, chosen_rule) = match matching_rules.first().copied() {
+            Some(pair) => pair,
+            None => {
+                debug!(
+                    target = %resolved_target,
+                    action = ?request.action_type,
+                    "No matching policy rule found; default deny"
+                );
+                return PolicyDecisionResponse {
+                    decision: Decision::Deny,
+                    reason: DecisionReason {
+                        policy_id: "default-fail-closed".to_string(),
+                        rule_id: None,
+                        explanation: "No matching policy rule found; default deny".to_string(),
+                    },
+                    matched_policy_id: "default-fail-closed".to_string(),
+                    evaluated_at: Utc::now(),
+                    resolved_resource: resolved_resource_opt,
+                };
+            }
+        };
 
         debug!(
             agent = %request.agent_id,
@@ -347,17 +371,20 @@ mod tests {
 
     // CASE 3b: What happens if the internal storage lock is poisoned.
     // The policy engine MUST handle poisoned locks gracefully and fail closed to Deny.
+    // When clear() is called, it clears the poison so the operator can recover.
     #[test]
-    fn test_audit_policy_lock_poisoning_resolves_to_deny() {
+    fn test_audit_policy_lock_poisoning_and_clear_recovery() {
         let engine = std::sync::Arc::new(PolicyEngine::new());
-        let engine_clone = engine.clone();
-
-        // Deliberately poison the lock by panicking on a background thread while holding write lock
-        let _ = std::thread::spawn(move || {
-            let mut guard = engine_clone.policies.write().unwrap();
-            guard.push(Policy::new("p1", "p1", 1));
-            panic!("Poisoning write lock");
-        }).join();
+        let policy = Policy::new("p-allow", "Allow policy", 1).with_rule(PolicyRule {
+            id: "r-allow".to_string(),
+            description: "Allow".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "*".to_string(),
+            priority: 10,
+        });
+        engine.add_policy(policy.clone());
 
         let req = ActionRequest::new(
             "agent-001",
@@ -366,13 +393,202 @@ mod tests {
             },
         );
 
-        let decision = engine.evaluate(&req);
+        let engine_clone = engine.clone();
+        // Deliberately poison the lock by panicking on a background thread while holding write lock
+        let _ = std::thread::spawn(move || {
+            let mut guard = engine_clone.policies.write().unwrap();
+            guard.push(Policy::new("p1", "p1", 1));
+            panic!("Poisoning write lock");
+        }).join();
+
+        // While poisoned, evaluate MUST Deny
+        let decision_poisoned = engine.evaluate(&req);
         assert_eq!(
-            decision.decision,
+            decision_poisoned.decision,
             Decision::Deny,
             "Must resolve to Deny when storage lock is poisoned"
         );
-        assert_eq!(decision.matched_policy_id, "fail-closed-lock-poisoned");
+        assert_eq!(decision_poisoned.matched_policy_id, "fail-closed-lock-poisoned");
+
+        // Operator calls clear() to clear the poison flag and reset policy state
+        engine.clear();
+
+        // Re-add known-good policy
+        engine.add_policy(policy);
+
+        // Subsequent evaluation succeeds with Allow
+        let decision_recovered = engine.evaluate(&req);
+        assert_eq!(
+            decision_recovered.decision,
+            Decision::Allow,
+            "Must successfully evaluate after clear() clears poison and reloads policies"
+        );
+    }
+
+    // CASE 4: Adversarial cases - empty patterns match nothing and resolve to Deny.
+    #[test]
+    fn test_audit_empty_rule_patterns_do_not_match_and_resolve_to_deny() {
+        let engine = PolicyEngine::new();
+
+        // Rule with empty agent_pattern
+        let policy_empty_agent = Policy::new("p-empty-agent", "p", 1).with_rule(PolicyRule {
+            id: "r1".to_string(),
+            description: "empty agent".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "*".to_string(),
+            priority: 10,
+        });
+        engine.add_policy(policy_empty_agent);
+
+        let req = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: "/tmp/test.txt".to_string(),
+            },
+        );
+        assert_eq!(engine.evaluate(&req).decision, Decision::Deny);
+
+        // Rule with empty action_types
+        engine.clear();
+        let policy_empty_actions = Policy::new("p-empty-actions", "p", 1).with_rule(PolicyRule {
+            id: "r2".to_string(),
+            description: "empty actions".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![],
+            resource_pattern: "*".to_string(),
+            priority: 10,
+        });
+        engine.add_policy(policy_empty_actions);
+        assert_eq!(engine.evaluate(&req).decision, Decision::Deny);
+
+        // Rule with empty resource_pattern
+        engine.clear();
+        let policy_empty_resource = Policy::new("p-empty-resource", "p", 1).with_rule(PolicyRule {
+            id: "r3".to_string(),
+            description: "empty resource".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "".to_string(),
+            priority: 10,
+        });
+        engine.add_policy(policy_empty_resource);
+        assert_eq!(engine.evaluate(&req).decision, Decision::Deny);
+    }
+
+    // CASE 5: Adversarial cases - unresolvable paths resolve to Deny.
+    #[test]
+    fn test_audit_unresolvable_paths_resolve_to_deny() {
+        let engine = PolicyEngine::new();
+        let policy = Policy::new("p-allow-all", "Allow all", 1).with_rule(PolicyRule {
+            id: "r-all".to_string(),
+            description: "all".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "*".to_string(),
+            priority: 10,
+        });
+        engine.add_policy(policy);
+
+        // Path with null byte
+        let req_null = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: "/tmp/null\0byte.txt".to_string(),
+            },
+        );
+        assert_eq!(engine.evaluate(&req_null).decision, Decision::Deny);
+
+        // Path with empty string
+        let req_empty = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: "".to_string(),
+            },
+        );
+        assert_eq!(engine.evaluate(&req_empty).decision, Decision::Deny);
+    }
+
+    // CASE 6: Adversarial cases - malformed request with unknown action type is rejected.
+    #[test]
+    fn test_audit_malformed_request_unknown_action_type_never_allowed() {
+        let engine = PolicyEngine::new();
+        let policy = Policy::new("p-allow-all", "Allow all", 1).with_rule(PolicyRule {
+            id: "r-all".to_string(),
+            description: "all".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile, ActionType::WriteFile],
+            resource_pattern: "*".to_string(),
+            priority: 10,
+        });
+        engine.add_policy(policy);
+
+        // Malformed request with unknown action type string
+        let malformed_req_json = r#"{
+            "correlation_id": "00000000-0000-0000-0000-000000000001",
+            "timestamp": "2026-10-15T12:00:00Z",
+            "agent_id": "agent-001",
+            "action_type": "UNKNOWN_MALICIOUS_ACTION",
+            "payload": {
+                "type": "UNKNOWN_ACTION",
+                "details": {}
+            },
+            "target_resource": "/tmp/secret.txt"
+        }"#;
+
+        let parse_result = serde_json::from_str::<ActionRequest>(malformed_req_json);
+        assert!(parse_result.is_err(), "Malformed request with unknown action type must be rejected at deserialization boundary");
+    }
+
+    // CASE 7: Non-atomic config load preserves existing policies if parsing fails.
+    #[test]
+    fn test_audit_non_atomic_config_load_preserves_existing_policies() {
+        let engine = PolicyEngine::new();
+        let valid_json = r#"{
+            "id": "policy-valid",
+            "name": "Valid Policy",
+            "version": 1,
+            "rules": [{
+                "id": "rule-allow-valid",
+                "description": "Allow read",
+                "decision": "ALLOW",
+                "agent_pattern": "*",
+                "action_types": ["READ_FILE"],
+                "resource_pattern": "*",
+                "priority": 10
+            }]
+        }"#;
+
+        // 1. Successfully load valid policy
+        let load_res = engine.load_policy_from_json(valid_json);
+        assert!(load_res.is_ok());
+
+        let req = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: "/tmp/test.txt".to_string(),
+            },
+        );
+        assert_eq!(engine.evaluate(&req).decision, Decision::Allow);
+
+        // 2. Attempt to load corrupted / invalid JSON
+        let invalid_json = r#"{"id": "broken", "rules": [ INVALID_JSON"#;
+        let fail_res = engine.load_policy_from_json(invalid_json);
+        assert!(fail_res.is_err(), "Invalid JSON must fail load");
+
+        // 3. Previously loaded policy set must remain exactly intact and evaluate to Allow
+        let decision_after = engine.evaluate(&req);
+        assert_eq!(
+            decision_after.decision,
+            Decision::Allow,
+            "Existing policies must remain active after failed load"
+        );
+        assert_eq!(decision_after.matched_policy_id, "policy-valid");
     }
 }
 

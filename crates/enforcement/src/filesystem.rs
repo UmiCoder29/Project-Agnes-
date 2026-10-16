@@ -49,7 +49,14 @@ impl FilesystemEnforcer {
 
     pub fn register_sandbox_root(&self, root: impl AsRef<Path>) {
         if let Ok(canonical) = root.as_ref().canonicalize() {
-            let mut guard = self.sandbox_roots.write().expect("lock poisoned");
+            let mut guard = match self.sandbox_roots.write() {
+                Ok(g) => g,
+                Err(poisoned) => {
+                    tracing::warn!("Recovering poisoned sandbox_roots write lock");
+                    poisoned.into_inner()
+                }
+            };
+            self.sandbox_roots.clear_poison();
             if !guard.contains(&canonical) {
                 info!(root = %canonical.display(), "Registered sandbox root for kernel confinement");
                 guard.push(canonical);
@@ -144,7 +151,18 @@ impl FilesystemEnforcer {
         // Find enclosing sandbox root. The sandbox root MUST enclose the authorized expected_path.
         let target_path = Path::new(raw_path);
         let expected_path = Path::new(expected_resolved_target);
-        let matching_root = self.find_sandbox_root(expected_path, target_path, &decision_resp.matched_policy_id);
+        let matching_root = match self.find_sandbox_root(expected_path, target_path, &decision_resp.matched_policy_id) {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::error!("Enforcer sandbox_roots lock is poisoned: fail-closed DENY");
+                return EnforcementResult {
+                    enforcement_action: EnforcementAction::BlockRequest,
+                    observed_result: ObservedResult::BlockedByFirewall,
+                    output: None,
+                    error_message: Some("Internal error: sandbox roots lock poisoned (fail-closed block)".to_string()),
+                };
+            }
+        };
 
         let root_dir = match matching_root {
             Some(r) => r,
@@ -167,8 +185,8 @@ impl FilesystemEnforcer {
         self.enforce_kernel_confined_read(&root_dir, target_path, raw_path, expected_resolved_target)
     }
 
-    fn find_sandbox_root(&self, expected_path: &Path, target_path: &Path, _policy_id: &str) -> Option<PathBuf> {
-        let roots = self.sandbox_roots.read().expect("lock poisoned");
+    fn find_sandbox_root(&self, expected_path: &Path, target_path: &Path, _policy_id: &str) -> Result<Option<PathBuf>, ()> {
+        let roots = self.sandbox_roots.read().map_err(|_| ())?;
 
         // The sandbox root MUST enclose the policy-approved expected_path.
         // If multiple roots enclose expected_path, select the most specific one (longest prefix).
@@ -189,7 +207,7 @@ impl FilesystemEnforcer {
         }
 
         if best_root.is_some() {
-            return best_root;
+            return Ok(best_root);
         }
 
         // If expected_path was not directly enclosed, check if target_path or normalized target_path
@@ -198,11 +216,11 @@ impl FilesystemEnforcer {
         // which could select an unapproved root or re-read disk state.
         for root in roots.iter() {
             if target_path.starts_with(root) && expected_path.starts_with(root) {
-                return Some(root.clone());
+                return Ok(Some(root.clone()));
             }
         }
 
-        None
+        Ok(None)
     }
 
     pub fn normalize_path(path: &Path) -> PathBuf {
@@ -269,8 +287,7 @@ impl FilesystemEnforcer {
             // Raw path might contain traversal sequences like `/allowed/../forbidden`
             // Strip the root prefix manually if it starts with root string
             let root_str = root_dir.to_string_lossy();
-            if raw_path.starts_with(root_str.as_ref()) {
-                let rest = &raw_path[root_str.len()..];
+            if let Some(rest) = raw_path.strip_prefix(root_str.as_ref()) {
                 rest.trim_start_matches('/').to_string()
             } else {
                 raw_path.to_string()
@@ -424,6 +441,61 @@ impl FilesystemEnforcer {
                 error_message: Some(format!("Error reading opened file: {}", e)),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agnes_common::{ActionPayload, ActionRequest, Decision, PolicyDecisionResponse, DecisionReason};
+
+    #[test]
+    fn test_enforcer_poisoned_sandbox_roots_produces_controlled_denial() {
+        let enforcer = std::sync::Arc::new(FilesystemEnforcer::new());
+        let enforcer_clone = enforcer.clone();
+
+        // Poison the sandbox_roots lock
+        let _ = std::thread::spawn(move || {
+            let mut guard = enforcer_clone.sandbox_roots.write().unwrap();
+            guard.push(PathBuf::from("/sandbox"));
+            panic!("Poisoning sandbox_roots write lock");
+        }).join();
+
+        let req = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: "/sandbox/file.txt".to_string(),
+            },
+        );
+
+        let decision = PolicyDecisionResponse {
+            decision: Decision::Allow,
+            reason: DecisionReason {
+                policy_id: "p1".to_string(),
+                rule_id: None,
+                explanation: "allowed".to_string(),
+            },
+            matched_policy_id: "p1".to_string(),
+            evaluated_at: chrono::Utc::now(),
+            resolved_resource: Some("/sandbox/file.txt".to_string()),
+        };
+
+        let result = enforcer.enforce_read(&req, &decision);
+        assert_eq!(
+            result.observed_result,
+            ObservedResult::BlockedByFirewall,
+            "Enforcer must produce BlockedByFirewall when sandbox_roots lock is poisoned"
+        );
+        assert_eq!(
+            result.enforcement_action,
+            EnforcementAction::BlockRequest,
+            "Enforcer must produce BlockRequest when sandbox_roots lock is poisoned"
+        );
+        assert!(
+            result.error_message.as_deref().unwrap_or_default().contains("lock poisoned"),
+            "Error message must clearly state lock poisoned"
+        );
+        assert_eq!(result.output, None);
     }
 }
 

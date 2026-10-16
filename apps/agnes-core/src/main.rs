@@ -101,7 +101,13 @@ async fn agent_state_handler(
     AxumPath(agent_id): AxumPath<String>,
 ) -> impl IntoResponse {
     match state.state_engine.get_session(&agent_id) {
-        Some(session) => (StatusCode::OK, Json(serde_json::to_value(session).unwrap())),
+        Some(session) => match serde_json::to_value(session) {
+            Ok(val) => (StatusCode::OK, Json(val)),
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("Serialization failure: {}", err) })),
+            ),
+        },
         None => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "Agent session not found" })),
