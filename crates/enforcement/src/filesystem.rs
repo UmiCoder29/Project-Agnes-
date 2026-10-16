@@ -53,46 +53,166 @@ impl FilesystemFoldingProbe for DefaultFilesystemFoldingProbe {
     }
 }
 
+/// Metadata returned by `FoldingFsLookup` implementations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeFileMetadata {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// Filesystem lookup abstraction used by folding detection.
+/// Allows unit tests to simulate case-insensitive and normalization-folding filesystems.
+pub trait FoldingFsLookup: Send + Sync {
+    /// Checks if the path is a directory.
+    fn is_dir(&self, path: &Path) -> bool;
+
+    /// Creates a new probe file inside `root` with the given leaf name.
+    /// Fails if the file already exists or if the filesystem is read-only.
+    fn create(&self, root: &Path, name: &str) -> std::io::Result<()>;
+
+    /// Fetches file metadata by leaf name inside `root`.
+    fn metadata(&self, root: &Path, name: &str) -> std::io::Result<ProbeFileMetadata>;
+
+    /// Removes a file by leaf name inside `root`.
+    fn remove(&self, root: &Path, name: &str) -> std::io::Result<()>;
+
+    /// Lists directory entry names inside `root` for read-only probing.
+    fn read_dir(&self, root: &Path) -> std::io::Result<Vec<String>>;
+}
+
+/// Production implementation of `FoldingFsLookup` backed by `std::fs`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StdFoldingFsLookup;
+
+impl FoldingFsLookup for StdFoldingFsLookup {
+    fn is_dir(&self, path: &Path) -> bool {
+        path.is_dir()
+    }
+
+    fn create(&self, root: &Path, name: &str) -> std::io::Result<()> {
+        let p = root.join(name);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&p)?;
+        drop(file);
+        Ok(())
+    }
+
+    fn metadata(&self, root: &Path, name: &str) -> std::io::Result<ProbeFileMetadata> {
+        let p = root.join(name);
+        let m = fs::symlink_metadata(&p)?;
+        Ok(ProbeFileMetadata {
+            dev: m.dev(),
+            ino: m.ino(),
+        })
+    }
+
+    fn remove(&self, root: &Path, name: &str) -> std::io::Result<()> {
+        let p = root.join(name);
+        fs::remove_file(&p)
+    }
+
+    fn read_dir(&self, root: &Path) -> std::io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            if let Ok(name) = entry.file_name().into_string() {
+                names.push(name);
+            }
+        }
+        Ok(names)
+    }
+}
+
 const PROBE_NFC_CHAR: &str = "\u{00e9}"; // é (composed NFC, U+00E9, [0xC3, 0xA9])
 const PROBE_NFD_CHAR: &str = "e\u{0301}"; // e + combining acute accent (decomposed NFD)
 const PROBE_UPPER_NFC_CHAR: &str = "\u{00c9}"; // É (uppercase NFC, U+00C9)
 
+const NORMALIZATION_PAIRS: &[(&str, &str)] = &[
+    ("\u{00e9}", "e\u{0301}"),
+    ("\u{00e8}", "e\u{0300}"),
+    ("\u{00e0}", "a\u{0300}"),
+    ("\u{00e1}", "a\u{0301}"),
+    ("\u{00fc}", "u\u{0308}"),
+    ("\u{00f6}", "o\u{0308}"),
+    ("\u{00e4}", "a\u{0308}"),
+    ("\u{00f1}", "n\u{0303}"),
+    ("\u{00c9}", "E\u{0301}"),
+    ("\u{00dc}", "U\u{0308}"),
+];
+
 /// Detects whether the filesystem hosting `root` folds case or Unicode normalization.
+///
+/// # Security Limitations
+///
+/// **Per-Directory & Sub-Mount Limit**:
+/// This probe inspects only the root directory entry itself. It does NOT probe:
+/// 1. Subdirectories inside the root that may have filesystem-level casefolding enabled
+///    (e.g., Linux ext4 per-directory casefolding via `chattr +F` / `EXT4_CASEFOLD_FL`).
+/// 2. Sub-mounts of case-insensitive or Unicode normalization-folding foreign filesystems
+///    (such as VFAT, exFAT, NTFS, or macOS CIFS/NFS shares) mounted beneath the root.
+///
+/// Administrators deploying Project Agnes must ensure the entire directory tree beneath
+/// each configured sandbox root is mounted uniformly on a case-sensitive, non-folding
+/// filesystem without directory-level folding attributes enabled.
 pub fn detect_filesystem_folding(root: &Path) -> Result<(), String> {
-    if !root.is_dir() {
+    detect_filesystem_folding_with_fs(root, &StdFoldingFsLookup)
+}
+
+/// Detects whether the filesystem hosting `root` folds case or Unicode normalization
+/// using the supplied `FoldingFsLookup` implementation.
+pub fn detect_filesystem_folding_with_fs(root: &Path, fs: &dyn FoldingFsLookup) -> Result<(), String> {
+    if !fs.is_dir(root) {
         return Err(format!("Root '{}' is not a directory", root.display()));
     }
 
     // 1. Attempt writable probe: create a temporary file with a unique name
     let probe_uuid = uuid::Uuid::new_v4();
     let probe_leaf = format!(".agnes_probe_{}_fold_test_{}", probe_uuid, PROBE_NFC_CHAR);
-    let probe_path = root.join(&probe_leaf);
 
-    match fs::OpenOptions::new().write(true).create_new(true).open(&probe_path) {
-        Ok(file) => {
+    match fs.create(root, &probe_leaf) {
+        Ok(()) => {
             // Ensure probe file is removed in ALL outcomes via RAII guard
-            struct ProbeGuard<'a>(&'a Path);
+            struct ProbeGuard<'a> {
+                fs: &'a dyn FoldingFsLookup,
+                root: &'a Path,
+                leaf: &'a str,
+                active: bool,
+            }
             impl<'a> Drop for ProbeGuard<'a> {
                 fn drop(&mut self) {
-                    let _ = fs::remove_file(self.0);
+                    if self.active {
+                        let _ = self.fs.remove(self.root, self.leaf);
+                    }
                 }
             }
-            let _guard = ProbeGuard(&probe_path);
-            drop(file);
+            let _guard = ProbeGuard {
+                fs,
+                root,
+                leaf: &probe_leaf,
+                active: true,
+            };
+
+            let orig_meta = match fs.metadata(root, &probe_leaf) {
+                Ok(m) => m,
+                Err(e) => {
+                    return Err(format!(
+                        "Failed to query metadata for probe file '{}': {}",
+                        probe_leaf, e
+                    ));
+                }
+            };
 
             // Test 1: Case folding
             let case_swapped_leaf = format!(".AGNES_PROBE_{}_FOLD_TEST_{}", probe_uuid, PROBE_UPPER_NFC_CHAR);
-            let case_swapped_path = root.join(&case_swapped_leaf);
-
-            if let Ok(swapped_meta) = fs::symlink_metadata(&case_swapped_path) {
-                if let Ok(orig_meta) = fs::symlink_metadata(&probe_path) {
-                    if swapped_meta.dev() == orig_meta.dev() && swapped_meta.ino() == orig_meta.ino() {
-                        return Err(format!(
-                            "Filesystem at '{}' folds case: case-swapped probe '{}' resolves to probe file",
-                            root.display(),
-                            case_swapped_leaf
-                        ));
-                    }
+            if let Ok(swapped_meta) = fs.metadata(root, &case_swapped_leaf) {
+                if swapped_meta.dev == orig_meta.dev && swapped_meta.ino == orig_meta.ino {
+                    return Err(format!(
+                        "Filesystem at '{}' folds case: case-swapped probe '{}' resolves to probe file",
+                        root.display(),
+                        case_swapped_leaf
+                    ));
                 }
                 return Err(format!(
                     "Filesystem at '{}' folds case or collides: case-swapped probe '{}' exists",
@@ -103,17 +223,13 @@ pub fn detect_filesystem_folding(root: &Path) -> Result<(), String> {
 
             // Test 2: Unicode normalization folding
             let nfd_leaf = format!(".agnes_probe_{}_fold_test_{}", probe_uuid, PROBE_NFD_CHAR);
-            let nfd_path = root.join(&nfd_leaf);
-
-            if let Ok(nfd_meta) = fs::symlink_metadata(&nfd_path) {
-                if let Ok(orig_meta) = fs::symlink_metadata(&probe_path) {
-                    if nfd_meta.dev() == orig_meta.dev() && nfd_meta.ino() == orig_meta.ino() {
-                        return Err(format!(
-                            "Filesystem at '{}' folds Unicode normalization: NFD-variant probe '{}' resolves to probe file",
-                            root.display(),
-                            nfd_leaf
-                        ));
-                    }
+            if let Ok(nfd_meta) = fs.metadata(root, &nfd_leaf) {
+                if nfd_meta.dev == orig_meta.dev && nfd_meta.ino == orig_meta.ino {
+                    return Err(format!(
+                        "Filesystem at '{}' folds Unicode normalization: NFD-variant probe '{}' resolves to probe file",
+                        root.display(),
+                        nfd_leaf
+                    ));
                 }
                 return Err(format!(
                     "Filesystem at '{}' folds Unicode normalization: NFD-variant probe '{}' exists",
@@ -122,14 +238,16 @@ pub fn detect_filesystem_folding(root: &Path) -> Result<(), String> {
                 ));
             }
 
-            // Explicitly verify cleanup
+            // Explicitly drop guard so removal happens now
             drop(_guard);
-            if probe_path.exists() {
-                let _ = fs::remove_file(&probe_path);
-                if probe_path.exists() {
+
+            // Verify probe file was removed
+            if fs.metadata(root, &probe_leaf).is_ok() {
+                let _ = fs.remove(root, &probe_leaf);
+                if fs.metadata(root, &probe_leaf).is_ok() {
                     return Err(format!(
                         "Failed to clean up temporary probe file '{}'",
-                        probe_path.display()
+                        probe_leaf
                     ));
                 }
             }
@@ -141,7 +259,7 @@ pub fn detect_filesystem_folding(root: &Path) -> Result<(), String> {
             if create_err.kind() == std::io::ErrorKind::PermissionDenied
                 || create_err.raw_os_error() == Some(libc::EROFS)
             {
-                probe_read_only_root(root)
+                probe_read_only_root(root, fs)
             } else {
                 Err(format!(
                     "Failed to create probe file in root '{}': {}",
@@ -153,8 +271,25 @@ pub fn detect_filesystem_folding(root: &Path) -> Result<(), String> {
     }
 }
 
-fn probe_read_only_root(root: &Path) -> Result<(), String> {
-    let entries = fs::read_dir(root).map_err(|e| {
+/// Probes a read-only root directory for case and Unicode normalization folding using existing entries.
+///
+/// # Security Limitations
+///
+/// **Read-Only Partial-Coverage Limit**:
+/// When a root directory is read-only, Project Agnes cannot create a controlled probe file
+/// containing known ASCII letters and specific multi-byte NFC/NFD Unicode sequences.
+/// Probing must rely entirely on whatever entries already exist in the directory:
+/// - If existing entries contain only ASCII letters, only case folding can be probed; Unicode
+///   normalization folding cannot be verified.
+/// - If existing entries contain only non-ASCII characters, only Unicode normalization can be probed;
+///   case folding cannot be verified.
+/// - If entries contain neither (e.g. only numbers, or an empty directory), neither probe is possible
+///   and the root is rejected fail-closed.
+/// - Even when suitable entries exist, they only test the specific characters present in those filenames;
+///   untested Unicode sequences or filesystem-specific folding quirks outside the existing entry set
+///   cannot be validated.
+pub fn probe_read_only_root(root: &Path, fs: &dyn FoldingFsLookup) -> Result<(), String> {
+    let entries = fs.read_dir(root).map_err(|e| {
         format!(
             "Root '{}' is not writable and directory entries cannot be read: {}",
             root.display(),
@@ -165,19 +300,12 @@ fn probe_read_only_root(root: &Path) -> Result<(), String> {
     let mut found_cased_entry = false;
     let mut found_unicode_entry = false;
 
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let name_str = match file_name.to_str() {
-            Some(s) => s,
-            None => continue,
-        };
-
+    for name_str in &entries {
         if name_str == "." || name_str == ".." {
             continue;
         }
 
-        let entry_path = entry.path();
-        let orig_meta = match fs::symlink_metadata(&entry_path) {
+        let orig_meta = match fs.metadata(root, name_str) {
             Ok(m) => m,
             Err(_) => continue,
         };
@@ -185,11 +313,10 @@ fn probe_read_only_root(root: &Path) -> Result<(), String> {
         // Case probe on existing entry
         if !found_cased_entry && name_str.chars().any(|c| c.is_alphabetic()) {
             let swapped_name = swap_case_string(name_str);
-            if swapped_name != name_str {
+            if swapped_name != *name_str {
                 found_cased_entry = true;
-                let swapped_path = root.join(&swapped_name);
-                if let Ok(swapped_meta) = fs::symlink_metadata(&swapped_path) {
-                    if swapped_meta.dev() == orig_meta.dev() && swapped_meta.ino() == orig_meta.ino() {
+                if let Ok(swapped_meta) = fs.metadata(root, &swapped_name) {
+                    if swapped_meta.dev == orig_meta.dev && swapped_meta.ino == orig_meta.ino {
                         return Err(format!(
                             "Filesystem at '{}' folds case: existing entry '{}' resolves to case-swapped '{}'",
                             root.display(),
@@ -205,9 +332,8 @@ fn probe_read_only_root(root: &Path) -> Result<(), String> {
         if !found_unicode_entry {
             if let Some(variant_name) = toggle_normalization_string(name_str) {
                 found_unicode_entry = true;
-                let variant_path = root.join(&variant_name);
-                if let Ok(var_meta) = fs::symlink_metadata(&variant_path) {
-                    if var_meta.dev() == orig_meta.dev() && var_meta.ino() == orig_meta.ino() {
+                if let Ok(var_meta) = fs.metadata(root, &variant_name) {
+                    if var_meta.dev == orig_meta.dev && var_meta.ino == orig_meta.ino {
                         return Err(format!(
                             "Filesystem at '{}' folds Unicode normalization: existing entry '{}' resolves to variant '{}'",
                             root.display(),
@@ -249,20 +375,7 @@ fn swap_case_string(s: &str) -> String {
 }
 
 fn toggle_normalization_string(s: &str) -> Option<String> {
-    const PAIRS: &[(&str, &str)] = &[
-        ("\u{00e9}", "e\u{0301}"),
-        ("\u{00e8}", "e\u{0300}"),
-        ("\u{00e0}", "a\u{0300}"),
-        ("\u{00e1}", "a\u{0301}"),
-        ("\u{00fc}", "u\u{0308}"),
-        ("\u{00f6}", "o\u{0308}"),
-        ("\u{00e4}", "a\u{0308}"),
-        ("\u{00f1}", "n\u{0303}"),
-        ("\u{00c9}", "E\u{0301}"),
-        ("\u{00dc}", "U\u{0308}"),
-    ];
-
-    for &(nfc, nfd) in PAIRS {
+    for &(nfc, nfd) in NORMALIZATION_PAIRS {
         if s.contains(nfc) {
             return Some(s.replace(nfc, nfd));
         } else if s.contains(nfd) {
@@ -739,5 +852,270 @@ mod tests {
         );
         assert_eq!(result.output, None);
     }
+
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MockFoldingMode {
+        None,
+        CaseInsensitive,
+        UnicodeNormalization,
+    }
+
+    pub struct SimulatedFs {
+        pub mode: MockFoldingMode,
+        pub writable: bool,
+        pub files: Mutex<HashMap<String, ProbeFileMetadata>>,
+        pub next_ino: AtomicU64,
+        pub removed_files: Mutex<Vec<String>>,
+    }
+
+    impl SimulatedFs {
+        pub fn new(mode: MockFoldingMode, writable: bool) -> Self {
+            Self {
+                mode,
+                writable,
+                files: Mutex::new(HashMap::new()),
+                next_ino: AtomicU64::new(100),
+                removed_files: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub fn add_file(&self, name: &str) {
+            let ino = self.next_ino.fetch_add(1, Ordering::SeqCst);
+            self.files.lock().unwrap().insert(
+                name.to_string(),
+                ProbeFileMetadata { dev: 1, ino },
+            );
+        }
+
+        pub fn active_file_count(&self) -> usize {
+            self.files.lock().unwrap().len()
+        }
+
+        pub fn was_removed(&self, name_prefix: &str) -> bool {
+            let removed = self.removed_files.lock().unwrap();
+            removed.iter().any(|r| r.starts_with(name_prefix))
+        }
+
+        fn lookup_key(&self, name: &str) -> String {
+            match self.mode {
+                MockFoldingMode::None => name.to_string(),
+                MockFoldingMode::CaseInsensitive => name.to_lowercase(),
+                MockFoldingMode::UnicodeNormalization => {
+                    let mut out = name.to_string();
+                    for &(nfc, nfd) in NORMALIZATION_PAIRS {
+                        if out.contains(nfd) {
+                            out = out.replace(nfd, nfc);
+                        }
+                    }
+                    out
+                }
+            }
+        }
+    }
+
+    impl FoldingFsLookup for SimulatedFs {
+        fn is_dir(&self, _path: &Path) -> bool {
+            true
+        }
+
+        fn create(&self, _root: &Path, name: &str) -> std::io::Result<()> {
+            if !self.writable {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Read-only filesystem",
+                ));
+            }
+            let mut files = self.files.lock().unwrap();
+            let key = self.lookup_key(name);
+            if files.keys().any(|k| self.lookup_key(k) == key) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "File already exists",
+                ));
+            }
+            let ino = self.next_ino.fetch_add(1, Ordering::SeqCst);
+            files.insert(name.to_string(), ProbeFileMetadata { dev: 1, ino });
+            Ok(())
+        }
+
+        fn metadata(&self, _root: &Path, name: &str) -> std::io::Result<ProbeFileMetadata> {
+            let files = self.files.lock().unwrap();
+            let key = self.lookup_key(name);
+            for (fname, meta) in files.iter() {
+                if self.lookup_key(fname) == key {
+                    return Ok(*meta);
+                }
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("File '{}' not found", name),
+            ))
+        }
+
+        fn remove(&self, _root: &Path, name: &str) -> std::io::Result<()> {
+            let mut files = self.files.lock().unwrap();
+            let key = self.lookup_key(name);
+            let mut found_key = None;
+            for fname in files.keys() {
+                if self.lookup_key(fname) == key {
+                    found_key = Some(fname.clone());
+                    break;
+                }
+            }
+            if let Some(k) = found_key {
+                files.remove(&k);
+                self.removed_files.lock().unwrap().push(name.to_string());
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("File '{}' not found for removal", name),
+                ))
+            }
+        }
+
+        fn read_dir(&self, _root: &Path) -> std::io::Result<Vec<String>> {
+            let files = self.files.lock().unwrap();
+            Ok(files.keys().cloned().collect())
+        }
+    }
+
+    #[test]
+    fn test_simulated_fs_writable_case_folding_rejected_and_probe_removed() {
+        let sim_fs = SimulatedFs::new(MockFoldingMode::CaseInsensitive, true);
+        let res = detect_filesystem_folding_with_fs(Path::new("/simulated/root"), &sim_fs);
+        assert!(
+            res.is_err(),
+            "Simulated case-folding filesystem must be rejected on writable probe"
+        );
+        let err_msg = res.unwrap_err();
+        assert!(
+            err_msg.contains("folds case"),
+            "Error must specify case folding: {}",
+            err_msg
+        );
+        assert_eq!(
+            sim_fs.active_file_count(),
+            0,
+            "Probe file must be unlinked and cleaned up after case folding early-error return"
+        );
+        assert!(
+            sim_fs.was_removed(".agnes_probe_"),
+            "Probe file removal must have been invoked on simulated filesystem"
+        );
+    }
+
+    #[test]
+    fn test_simulated_fs_writable_unicode_folding_rejected_and_probe_removed() {
+        let sim_fs = SimulatedFs::new(MockFoldingMode::UnicodeNormalization, true);
+        let res = detect_filesystem_folding_with_fs(Path::new("/simulated/root"), &sim_fs);
+        assert!(
+            res.is_err(),
+            "Simulated Unicode normalization-folding filesystem must be rejected on writable probe"
+        );
+        let err_msg = res.unwrap_err();
+        assert!(
+            err_msg.contains("Unicode normalization"),
+            "Error must specify Unicode normalization folding: {}",
+            err_msg
+        );
+        assert_eq!(
+            sim_fs.active_file_count(),
+            0,
+            "Probe file must be unlinked and cleaned up after Unicode folding early-error return"
+        );
+        assert!(
+            sim_fs.was_removed(".agnes_probe_"),
+            "Probe file removal must have been invoked on simulated filesystem"
+        );
+    }
+
+    #[test]
+    fn test_simulated_fs_writable_non_folding_accepted_and_probe_removed() {
+        let sim_fs = SimulatedFs::new(MockFoldingMode::None, true);
+        let res = detect_filesystem_folding_with_fs(Path::new("/simulated/root"), &sim_fs);
+        assert!(
+            res.is_ok(),
+            "Simulated non-folding filesystem must be accepted: {:?}",
+            res
+        );
+        assert_eq!(
+            sim_fs.active_file_count(),
+            0,
+            "Probe file must be unlinked and cleaned up after successful detection"
+        );
+        assert!(
+            sim_fs.was_removed(".agnes_probe_"),
+            "Probe file removal must have been invoked on simulated filesystem"
+        );
+    }
+
+    #[test]
+    fn test_simulated_fs_readonly_case_folding_rejected() {
+        let sim_fs = SimulatedFs::new(MockFoldingMode::CaseInsensitive, false);
+        sim_fs.add_file("entry_with_letters.txt");
+        let res = detect_filesystem_folding_with_fs(Path::new("/simulated/root"), &sim_fs);
+        assert!(
+            res.is_err(),
+            "Simulated case-folding filesystem must be rejected on read-only probe"
+        );
+        let err_msg = res.unwrap_err();
+        assert!(
+            err_msg.contains("folds case"),
+            "Error must specify case folding: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_simulated_fs_readonly_unicode_folding_rejected() {
+        let sim_fs = SimulatedFs::new(MockFoldingMode::UnicodeNormalization, false);
+        sim_fs.add_file("caf\u{00e9}.txt");
+        let res = detect_filesystem_folding_with_fs(Path::new("/simulated/root"), &sim_fs);
+        assert!(
+            res.is_err(),
+            "Simulated Unicode normalization-folding filesystem must be rejected on read-only probe"
+        );
+        let err_msg = res.unwrap_err();
+        assert!(
+            err_msg.contains("Unicode normalization"),
+            "Error must specify Unicode normalization folding: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_simulated_fs_readonly_non_folding_accepted() {
+        let sim_fs = SimulatedFs::new(MockFoldingMode::None, false);
+        sim_fs.add_file("entry_with_letters.txt");
+        sim_fs.add_file("caf\u{00e9}.txt");
+        let res = detect_filesystem_folding_with_fs(Path::new("/simulated/root"), &sim_fs);
+        assert!(
+            res.is_ok(),
+            "Simulated non-folding filesystem must be accepted on read-only probe: {:?}",
+            res
+        );
+    }
+
+    #[test]
+    fn test_simulated_fs_readonly_empty_rejected() {
+        let sim_fs = SimulatedFs::new(MockFoldingMode::None, false);
+        let res = detect_filesystem_folding_with_fs(Path::new("/simulated/root"), &sim_fs);
+        assert!(
+            res.is_err(),
+            "Empty read-only root must be rejected fail-closed"
+        );
+        let err_msg = res.unwrap_err();
+        assert!(
+            err_msg.contains("contains no suitable directory entries"),
+            "Error must state no suitable entries: {}",
+            err_msg
+        );
+    }
 }
+
 
