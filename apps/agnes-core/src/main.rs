@@ -11,7 +11,9 @@ use axum::{
 use agnes_common::{
     ActionRequest, ActionType, Decision, EnforcementAction, ObservedResult, SecurityEvent,
 };
-use agnes_enforcement::{EnforcementResult, FilesystemEnforcer};
+use agnes_enforcement::{
+    DefaultFilesystemFoldingProbe, EnforcementResult, FilesystemEnforcer, FilesystemFoldingProbe,
+};
 use agnes_policy::{Policy, PolicyEngine};
 use agnes_state::StateEngine;
 use agnes_telemetry::{InMemoryTelemetrySink, StructuredJsonLogSink, TelemetrySink};
@@ -43,17 +45,27 @@ pub struct GatewayActionResponse {
 
 use std::path::{Path, PathBuf};
 
-/// Configures sandbox roots on the given filesystem enforcer.
+/// Configures sandbox roots on the given filesystem enforcer using the default filesystem folding probe.
+pub fn configure_sandbox_roots(enforcer: &FilesystemEnforcer, roots_env: Option<&str>) -> Vec<PathBuf> {
+    configure_sandbox_roots_with_probe(enforcer, roots_env, &DefaultFilesystemFoldingProbe)
+}
+
+/// Configures sandbox roots with an injectable probe for case and Unicode normalization folding detection.
 ///
-/// Follows strict fail-closed requirements:
-/// - Reads a colon-separated list of paths (e.g. from AGNES_SANDBOX_ROOTS).
+/// Security constraints:
 /// - Each entry must be an absolute path (`p.is_absolute()`). Empty entries (leading, trailing, or
 ///   doubled colons) and relative paths (e.g. `.` or `path/to/dir`) are strictly rejected.
 /// - Never defaults to "/" or resolves relative paths against the current working directory.
 /// - Each root must exist, be resolvable to canonical form, and be a directory other than root "/".
-/// - If the variable is unset, empty, or if ANY entry is invalid, logs a clear error and registers
-///   NO roots in the enforcer (ReadFile actions stay denied).
-pub fn configure_sandbox_roots(enforcer: &FilesystemEnforcer, roots_env: Option<&str>) -> Vec<PathBuf> {
+/// - Startup check: for each root, verifies that the hosting filesystem does NOT fold case or
+///   Unicode normalization. If folding is detected, or if probing cannot be verified, rejects the root.
+/// - If the variable is unset, empty, or if ANY entry is invalid or on a folding filesystem, logs
+///   a clear error and registers NO roots in the enforcer (all-or-nothing fail-closed rule).
+pub fn configure_sandbox_roots_with_probe(
+    enforcer: &FilesystemEnforcer,
+    roots_env: Option<&str>,
+    probe: &dyn FilesystemFoldingProbe,
+) -> Vec<PathBuf> {
     let raw = match roots_env {
         Some(s) => s.trim(),
         None => {
@@ -113,6 +125,17 @@ pub fn configure_sandbox_roots(enforcer: &FilesystemEnforcer, roots_env: Option<
             error!(
                 root = %entry,
                 "AGNES_SANDBOX_ROOTS entry cannot be root directory '/'; starting gateway with NO sandbox roots"
+            );
+            return Vec::new();
+        }
+
+        // Startup folding probe check: detect case or Unicode normalization folding
+        if let Err(probe_err) = probe.detect_folding(&canonical) {
+            error!(
+                root = %entry,
+                canonical = %canonical.display(),
+                error = %probe_err,
+                "AGNES_SANDBOX_ROOTS entry rejected by filesystem folding probe; starting gateway with NO sandbox roots"
             );
             return Vec::new();
         }
@@ -543,6 +566,82 @@ mod tests {
                 "valid multi-root (dir 2)",
             );
         }
+    }
+
+    struct SimulatedFoldingProbe;
+    impl FilesystemFoldingProbe for SimulatedFoldingProbe {
+        fn detect_folding(&self, root: &Path) -> Result<(), String> {
+            Err(format!(
+                "Simulated folding filesystem detected for root '{}'",
+                root.display()
+            ))
+        }
+    }
+
+    #[test]
+    fn test_configure_sandbox_roots_simulated_folding_refuses_roots_and_blocks_read() {
+        let temp_dir = tempdir().unwrap();
+        let valid_dir = temp_dir.path().join("valid_dir");
+        fs::create_dir_all(&valid_dir).unwrap();
+        let canary_file = valid_dir.join("canary.txt");
+        fs::write(&canary_file, "CANARY_SECRET_DATA").unwrap();
+
+        let enforcer = FilesystemEnforcer::new();
+        let valid_dir_str = valid_dir.to_string_lossy().to_string();
+
+        let roots = configure_sandbox_roots_with_probe(
+            &enforcer,
+            Some(&valid_dir_str),
+            &SimulatedFoldingProbe,
+        );
+
+        assert!(
+            roots.is_empty(),
+            "Simulated folding filesystem must refuse root and register NO roots (all-or-nothing)"
+        );
+        assert_enforcer_blocks_canary(
+            &enforcer,
+            &canary_file,
+            "simulated folding filesystem must block file reads fail-closed",
+        );
+    }
+
+    #[test]
+    fn test_configure_sandbox_roots_normal_root_accepted_and_probe_file_cleaned_up() {
+        let temp_dir = tempdir().unwrap();
+        let valid_dir = temp_dir.path().join("valid_dir");
+        fs::create_dir_all(&valid_dir).unwrap();
+        let canary_file = valid_dir.join("canary.txt");
+        fs::write(&canary_file, "AUTHORIZED_PAYLOAD").unwrap();
+
+        let enforcer = FilesystemEnforcer::new();
+        let valid_dir_str = valid_dir.to_string_lossy().to_string();
+
+        let roots = configure_sandbox_roots(&enforcer, Some(&valid_dir_str));
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0], valid_dir.canonicalize().unwrap());
+
+        // Verify that the probe file was removed and never remains on disk
+        let entries: Vec<_> = fs::read_dir(&valid_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+
+        for name in &entries {
+            assert!(
+                !name.starts_with(".agnes_probe_"),
+                "Probe file '{}' must never remain on disk after startup check",
+                name
+            );
+        }
+        assert_eq!(entries, vec!["canary.txt"]);
+
+        assert_enforcer_permits_canary(
+            &enforcer,
+            &canary_file,
+            "AUTHORIZED_PAYLOAD",
+            "normal root accepted and canary readable",
+        );
     }
 
     #[tokio::test]

@@ -2569,6 +2569,280 @@ fn test_regression_030_non_existent_file_normalization_variants_match_same_rule(
     assert_eq!(eval_trailing.resolved_resource, eval_clean.resolved_resource);
 }
 
+// ============================================================================
+// REGRESSION-031: Case & Unicode normalization sensitivity and physical parent resolution
+// ============================================================================
+
+/// REGRESSION-031: Case and Unicode NFD variants of denied paths return no file content.
+///
+/// Verified fact: With Allow "<root>/*" and Deny "<root>/secret/*", a request for
+/// "<root>/SECRET/k.txt" or for a Unicode NFD spelling of an NFC directory fails
+/// byte-for-byte rule matching and falls through to the broad Allow rule, but the OS open
+/// fails because the underlying filesystem is case and normalization sensitive.
+/// This test pins that under no circumstances is file content returned.
+#[test]
+fn test_regression_031_denied_path_case_variant_and_unicode_nfd_variant_returns_no_content() {
+    let harness = SecurityTestHarness::new();
+    let temp = tempfile::tempdir().unwrap();
+    let sandbox_root = temp.path().join("sandbox");
+    let secret_dir = sandbox_root.join("secret");
+    let unicode_secret_dir = sandbox_root.join("secr\u{00e9}t"); // Composed NFC: é (U+00E9)
+
+    fs::create_dir_all(&secret_dir).unwrap();
+    fs::create_dir_all(&unicode_secret_dir).unwrap();
+
+    let secret_file_case = secret_dir.join("k.txt");
+    let secret_file_unicode = unicode_secret_dir.join("k.txt");
+
+    fs::write(&secret_file_case, "TOP_SECRET_CASE_PAYLOAD").unwrap();
+    fs::write(&secret_file_unicode, "TOP_SECRET_UNICODE_PAYLOAD").unwrap();
+
+    let canonical_root = sandbox_root.canonicalize().unwrap();
+    harness.fs_enforcer.register_sandbox_root(&canonical_root);
+
+    let root_str = canonical_root.to_str().unwrap();
+    let policy = Policy::new("p-case-unicode", "Case and Unicode", 1)
+        .with_rule(PolicyRule {
+            id: "rule-allow-sandbox".to_string(),
+            description: "Allow sandbox".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/*", root_str),
+            priority: 10,
+        })
+        .with_rule(PolicyRule {
+            id: "rule-deny-secret-case".to_string(),
+            description: "Deny secret case".to_string(),
+            decision: Decision::Deny,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/secret/*", root_str),
+            priority: 20,
+        })
+        .with_rule(PolicyRule {
+            id: "rule-deny-secret-unicode".to_string(),
+            description: "Deny secret unicode".to_string(),
+            decision: Decision::Deny,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/secr\u{00e9}t/*", root_str),
+            priority: 20,
+        });
+
+    harness.policy_engine.add_policy(policy).unwrap();
+
+    // 1. Direct clean requests to the exact denied paths are explicitly blocked by policy
+    let req_clean_case = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: secret_file_case.to_str().unwrap().to_string(),
+        },
+    ).with_test_id("REGRESSION-031-CLEAN-CASE");
+    let eval_clean_case = harness.policy_engine.evaluate(&req_clean_case);
+    assert_eq!(eval_clean_case.decision, Decision::Deny);
+    let enf_clean_case = harness.fs_enforcer.enforce_read(&req_clean_case, &eval_clean_case);
+    assert_eq!(enf_clean_case.enforcement_action, EnforcementAction::BlockRequest);
+    assert_eq!(enf_clean_case.observed_result, ObservedResult::BlockedByFirewall);
+    assert_eq!(enf_clean_case.output, None);
+
+    let req_clean_unicode = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: secret_file_unicode.to_str().unwrap().to_string(),
+        },
+    ).with_test_id("REGRESSION-031-CLEAN-UNICODE");
+    let eval_clean_unicode = harness.policy_engine.evaluate(&req_clean_unicode);
+    assert_eq!(eval_clean_unicode.decision, Decision::Deny);
+    let enf_clean_unicode = harness.fs_enforcer.enforce_read(&req_clean_unicode, &eval_clean_unicode);
+    assert_eq!(enf_clean_unicode.enforcement_action, EnforcementAction::BlockRequest);
+    assert_eq!(enf_clean_unicode.observed_result, ObservedResult::BlockedByFirewall);
+    assert_eq!(enf_clean_unicode.output, None);
+
+    // 2. Request using case variant: "<root>/SECRET/k.txt"
+    let case_variant_path = format!("{}/SECRET/k.txt", root_str);
+    let req_case_variant = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: case_variant_path,
+        },
+    ).with_test_id("REGRESSION-031-CASE-VARIANT");
+    let eval_case_variant = harness.policy_engine.evaluate(&req_case_variant);
+    // Verified fact: Under Allow "<root>/*" and Deny "<root>/secret/*", "/SECRET/k.txt"
+    // does not match Deny "/secret/*" byte-for-byte and falls through to Allow "<root>/*".
+    assert_eq!(
+        eval_case_variant.decision,
+        Decision::Allow,
+        "Case variant request evaluates to Allow due to byte-for-byte comparison"
+    );
+
+    let enf_case_variant = harness.fs_enforcer.enforce_read(&req_case_variant, &eval_case_variant);
+    // Because this filesystem is case-sensitive, "/SECRET/k.txt" does not exist and openat2 fails (ENOENT)
+    assert_eq!(
+        enf_case_variant.observed_result,
+        ObservedResult::AccessFailed,
+        "Open fails with AccessFailed because file does not exist on case-sensitive filesystem"
+    );
+    assert_eq!(
+        enf_case_variant.output, None,
+        "Case variant returns NO file content"
+    );
+
+    // 3. Request using Unicode NFD variant: "<root>/secr{e\u{0301}}t/k.txt"
+    // (decomposed NFD e + combining acute accent U+0301)
+    let nfd_variant_path = format!("{}/secr{}t/k.txt", root_str, "e\u{0301}");
+    let req_nfd_variant = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: nfd_variant_path,
+        },
+    ).with_test_id("REGRESSION-031-UNICODE-NFD-VARIANT");
+    let eval_nfd_variant = harness.policy_engine.evaluate(&req_nfd_variant);
+    // Verified fact: NFD variant does not match NFC Deny byte-for-byte and falls through to Allow
+    assert_eq!(
+        eval_nfd_variant.decision,
+        Decision::Allow,
+        "Unicode NFD variant evaluates to Allow due to byte-for-byte comparison"
+    );
+
+    let enf_nfd_variant = harness.fs_enforcer.enforce_read(&req_nfd_variant, &eval_nfd_variant);
+    // Because this filesystem is normalization-sensitive, NFD path does not exist and openat2 fails
+    assert_eq!(
+        enf_nfd_variant.observed_result,
+        ObservedResult::AccessFailed,
+        "Open fails with AccessFailed on normalization-sensitive filesystem"
+    );
+    assert_eq!(
+        enf_nfd_variant.output, None,
+        "Unicode NFD variant returns NO file content"
+    );
+}
+
+/// REGRESSION-031: A read through "link/../k.txt", where link points into a denied directory,
+/// is evaluated against the physical parent and denied.
+///
+/// In lexical path resolution, "allowed/link/../k.txt" would cancel out "link/.." to "allowed/k.txt" (Allow).
+/// In physical path resolution (Rule 4), symlinks are followed first. Following "link" enters
+/// "denied/sub", and ".." ascends to "denied", resolving physically to "denied/k.txt".
+/// The policy engine must evaluate this against the physical parent ("denied/k.txt") and Deny.
+#[test]
+fn test_regression_031_symlink_parent_traversal_evaluated_against_physical_parent_and_denied() {
+    let harness = SecurityTestHarness::new();
+    let temp = tempfile::tempdir().unwrap();
+    let sandbox_root = temp.path().join("sandbox");
+    let allowed_dir = sandbox_root.join("allowed");
+    let denied_dir = sandbox_root.join("denied");
+    let denied_sub = denied_dir.join("sub");
+
+    fs::create_dir_all(&allowed_dir).unwrap();
+    fs::create_dir_all(&denied_sub).unwrap();
+
+    let denied_k = denied_dir.join("k.txt");
+    fs::write(&denied_k, "TOP_SECRET_PHYSICAL_PARENT_DATA").unwrap();
+
+    // Create symlink: allowed/link -> denied/sub
+    let link_path = allowed_dir.join("link");
+    std::os::unix::fs::symlink(&denied_sub, &link_path).unwrap();
+
+    let canonical_root = sandbox_root.canonicalize().unwrap();
+    harness.fs_enforcer.register_sandbox_root(&canonical_root);
+
+    let root_str = canonical_root.to_str().unwrap();
+    let policy = Policy::new("p-parent-symlink", "Parent Symlink", 1)
+        .with_rule(PolicyRule {
+            id: "rule-allow-allowed".to_string(),
+            description: "Allow allowed".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/*", allowed_dir.display()),
+            priority: 10,
+        })
+        .with_rule(PolicyRule {
+            id: "rule-deny-denied".to_string(),
+            description: "Deny denied".to_string(),
+            decision: Decision::Deny,
+            agent_pattern: "agent-001".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: format!("{}/*", denied_dir.display()),
+            priority: 20,
+        });
+
+    harness.policy_engine.add_policy(policy).unwrap();
+
+    // Adversarial request: "allowed/link/../k.txt"
+    // Lexically: "allowed/k.txt" (would match Allow policy!)
+    // Physically: "denied/k.txt" (matches Deny policy!)
+    let adversarial_path = format!("{}/allowed/link/../k.txt", root_str);
+    let req = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: adversarial_path,
+        },
+    ).with_test_id("REGRESSION-031-PHYSICAL-PARENT-TRAVERSAL");
+
+    let eval = harness.policy_engine.evaluate(&req);
+
+    // Rule 4 requirement: Must be evaluated against real physical path, resolving to Deny
+    assert_eq!(
+        eval.decision,
+        Decision::Deny,
+        "Request through 'link/../k.txt' must be evaluated against physical parent and Denied"
+    );
+
+    // Verify resolved resource is indeed the physical parent target
+    let canonical_denied_k = denied_k.canonicalize().unwrap();
+    assert_eq!(
+        eval.resolved_resource.as_deref(),
+        canonical_denied_k.to_str(),
+        "Resolved resource must equal canonical physical target 'denied/k.txt'"
+    );
+
+    let enf = harness.fs_enforcer.enforce_read(&req, &eval);
+    assert_eq!(
+        enf.enforcement_action,
+        EnforcementAction::BlockRequest,
+        "Enforcement must block access to physical parent target"
+    );
+    assert_eq!(
+        enf.observed_result,
+        ObservedResult::BlockedByFirewall,
+        "Result must be BlockedByFirewall"
+    );
+    assert_eq!(
+        enf.output, None,
+        "No confidential data may be returned"
+    );
+}
+
+/// REGRESSION-031: Verify filesystem folding probe on active root and ensure probe cleanup.
+#[test]
+fn test_regression_031_filesystem_folding_probe_passes_and_cleans_up() {
+    let temp = tempfile::tempdir().unwrap();
+    let sandbox_root = temp.path().join("probe_test_dir");
+    fs::create_dir_all(&sandbox_root).unwrap();
+
+    let probe = agnes_enforcement::DefaultFilesystemFoldingProbe;
+    let res = agnes_enforcement::FilesystemFoldingProbe::detect_folding(&probe, &sandbox_root);
+    assert!(
+        res.is_ok(),
+        "DefaultFilesystemFoldingProbe must pass on Linux non-folding filesystem: {:?}",
+        res
+    );
+
+    // Verify that the temporary probe file was deleted and does not remain on disk
+    let entries: Vec<_> = fs::read_dir(&sandbox_root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        entries.is_empty(),
+        "Probe file must never remain on disk: found {:?}",
+        entries
+    );
+}
+
+
 
 
 

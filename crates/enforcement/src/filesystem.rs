@@ -4,6 +4,7 @@ use agnes_common::{
 use std::ffi::CString;
 use std::fs;
 use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::RwLock;
@@ -28,6 +29,247 @@ pub struct EnforcementResult {
     pub observed_result: ObservedResult,
     pub output: Option<String>,
     pub error_message: Option<String>,
+}
+
+/// Trait for probing whether a filesystem folds case or Unicode normalization forms.
+/// Used at startup to verify sandbox roots are strictly on byte-exact, non-folding filesystems.
+pub trait FilesystemFoldingProbe: Send + Sync {
+    /// Probes the given canonical directory.
+    /// Returns Ok(()) if the filesystem does not fold case or normalization.
+    /// Returns Err(String) if folding was detected or probing was not possible.
+    fn detect_folding(&self, root: &Path) -> Result<(), String>;
+}
+
+/// Production implementation of `FilesystemFoldingProbe`.
+/// Creates a temporary probe file with ASCII letters and composed NFC characters,
+/// and tests whether the case-swapped name or decomposed NFD-variant resolves to it.
+/// If the directory is read-only, tests using an existing directory entry.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefaultFilesystemFoldingProbe;
+
+impl FilesystemFoldingProbe for DefaultFilesystemFoldingProbe {
+    fn detect_folding(&self, root: &Path) -> Result<(), String> {
+        detect_filesystem_folding(root)
+    }
+}
+
+const PROBE_NFC_CHAR: &str = "\u{00e9}"; // é (composed NFC, U+00E9, [0xC3, 0xA9])
+const PROBE_NFD_CHAR: &str = "e\u{0301}"; // e + combining acute accent (decomposed NFD)
+const PROBE_UPPER_NFC_CHAR: &str = "\u{00c9}"; // É (uppercase NFC, U+00C9)
+
+/// Detects whether the filesystem hosting `root` folds case or Unicode normalization.
+pub fn detect_filesystem_folding(root: &Path) -> Result<(), String> {
+    if !root.is_dir() {
+        return Err(format!("Root '{}' is not a directory", root.display()));
+    }
+
+    // 1. Attempt writable probe: create a temporary file with a unique name
+    let probe_uuid = uuid::Uuid::new_v4();
+    let probe_leaf = format!(".agnes_probe_{}_fold_test_{}", probe_uuid, PROBE_NFC_CHAR);
+    let probe_path = root.join(&probe_leaf);
+
+    match fs::OpenOptions::new().write(true).create_new(true).open(&probe_path) {
+        Ok(file) => {
+            // Ensure probe file is removed in ALL outcomes via RAII guard
+            struct ProbeGuard<'a>(&'a Path);
+            impl<'a> Drop for ProbeGuard<'a> {
+                fn drop(&mut self) {
+                    let _ = fs::remove_file(self.0);
+                }
+            }
+            let _guard = ProbeGuard(&probe_path);
+            drop(file);
+
+            // Test 1: Case folding
+            let case_swapped_leaf = format!(".AGNES_PROBE_{}_FOLD_TEST_{}", probe_uuid, PROBE_UPPER_NFC_CHAR);
+            let case_swapped_path = root.join(&case_swapped_leaf);
+
+            if let Ok(swapped_meta) = fs::symlink_metadata(&case_swapped_path) {
+                if let Ok(orig_meta) = fs::symlink_metadata(&probe_path) {
+                    if swapped_meta.dev() == orig_meta.dev() && swapped_meta.ino() == orig_meta.ino() {
+                        return Err(format!(
+                            "Filesystem at '{}' folds case: case-swapped probe '{}' resolves to probe file",
+                            root.display(),
+                            case_swapped_leaf
+                        ));
+                    }
+                }
+                return Err(format!(
+                    "Filesystem at '{}' folds case or collides: case-swapped probe '{}' exists",
+                    root.display(),
+                    case_swapped_leaf
+                ));
+            }
+
+            // Test 2: Unicode normalization folding
+            let nfd_leaf = format!(".agnes_probe_{}_fold_test_{}", probe_uuid, PROBE_NFD_CHAR);
+            let nfd_path = root.join(&nfd_leaf);
+
+            if let Ok(nfd_meta) = fs::symlink_metadata(&nfd_path) {
+                if let Ok(orig_meta) = fs::symlink_metadata(&probe_path) {
+                    if nfd_meta.dev() == orig_meta.dev() && nfd_meta.ino() == orig_meta.ino() {
+                        return Err(format!(
+                            "Filesystem at '{}' folds Unicode normalization: NFD-variant probe '{}' resolves to probe file",
+                            root.display(),
+                            nfd_leaf
+                        ));
+                    }
+                }
+                return Err(format!(
+                    "Filesystem at '{}' folds Unicode normalization: NFD-variant probe '{}' exists",
+                    root.display(),
+                    nfd_leaf
+                ));
+            }
+
+            // Explicitly verify cleanup
+            drop(_guard);
+            if probe_path.exists() {
+                let _ = fs::remove_file(&probe_path);
+                if probe_path.exists() {
+                    return Err(format!(
+                        "Failed to clean up temporary probe file '{}'",
+                        probe_path.display()
+                    ));
+                }
+            }
+
+            Ok(())
+        }
+        Err(create_err) => {
+            // If the root is not writable (e.g. PermissionDenied, ReadOnlyFilesystem), probe using existing directory entries
+            if create_err.kind() == std::io::ErrorKind::PermissionDenied
+                || create_err.raw_os_error() == Some(libc::EROFS)
+            {
+                probe_read_only_root(root)
+            } else {
+                Err(format!(
+                    "Failed to create probe file in root '{}': {}",
+                    root.display(),
+                    create_err
+                ))
+            }
+        }
+    }
+}
+
+fn probe_read_only_root(root: &Path) -> Result<(), String> {
+    let entries = fs::read_dir(root).map_err(|e| {
+        format!(
+            "Root '{}' is not writable and directory entries cannot be read: {}",
+            root.display(),
+            e
+        )
+    })?;
+
+    let mut found_cased_entry = false;
+    let mut found_unicode_entry = false;
+
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let name_str = match file_name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+
+        if name_str == "." || name_str == ".." {
+            continue;
+        }
+
+        let entry_path = entry.path();
+        let orig_meta = match fs::symlink_metadata(&entry_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        // Case probe on existing entry
+        if !found_cased_entry && name_str.chars().any(|c| c.is_alphabetic()) {
+            let swapped_name = swap_case_string(name_str);
+            if swapped_name != name_str {
+                found_cased_entry = true;
+                let swapped_path = root.join(&swapped_name);
+                if let Ok(swapped_meta) = fs::symlink_metadata(&swapped_path) {
+                    if swapped_meta.dev() == orig_meta.dev() && swapped_meta.ino() == orig_meta.ino() {
+                        return Err(format!(
+                            "Filesystem at '{}' folds case: existing entry '{}' resolves to case-swapped '{}'",
+                            root.display(),
+                            name_str,
+                            swapped_name
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Unicode normalization probe on existing entry
+        if !found_unicode_entry {
+            if let Some(variant_name) = toggle_normalization_string(name_str) {
+                found_unicode_entry = true;
+                let variant_path = root.join(&variant_name);
+                if let Ok(var_meta) = fs::symlink_metadata(&variant_path) {
+                    if var_meta.dev() == orig_meta.dev() && var_meta.ino() == orig_meta.ino() {
+                        return Err(format!(
+                            "Filesystem at '{}' folds Unicode normalization: existing entry '{}' resolves to variant '{}'",
+                            root.display(),
+                            name_str,
+                            variant_name
+                        ));
+                    }
+                }
+            }
+        }
+
+        if found_cased_entry && found_unicode_entry {
+            break;
+        }
+    }
+
+    if !found_cased_entry && !found_unicode_entry {
+        Err(format!(
+            "Root '{}' is not writable and contains no suitable directory entries with letters or non-ASCII characters to probe for case or Unicode folding",
+            root.display()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn swap_case_string(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_lowercase() {
+                c.to_uppercase().collect::<String>()
+            } else if c.is_uppercase() {
+                c.to_lowercase().collect::<String>()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+fn toggle_normalization_string(s: &str) -> Option<String> {
+    const PAIRS: &[(&str, &str)] = &[
+        ("\u{00e9}", "e\u{0301}"),
+        ("\u{00e8}", "e\u{0300}"),
+        ("\u{00e0}", "a\u{0300}"),
+        ("\u{00e1}", "a\u{0301}"),
+        ("\u{00fc}", "u\u{0308}"),
+        ("\u{00f6}", "o\u{0308}"),
+        ("\u{00e4}", "a\u{0308}"),
+        ("\u{00f1}", "n\u{0303}"),
+        ("\u{00c9}", "E\u{0301}"),
+        ("\u{00dc}", "U\u{0308}"),
+    ];
+
+    for &(nfc, nfd) in PAIRS {
+        if s.contains(nfc) {
+            return Some(s.replace(nfc, nfd));
+        } else if s.contains(nfd) {
+            return Some(s.replace(nfd, nfc));
+        }
+    }
+    None
 }
 
 pub struct FilesystemEnforcer {

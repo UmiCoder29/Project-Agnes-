@@ -86,8 +86,26 @@ pub fn clear_resolution_hook() {
 /// following all symbolic links, stripping redundant separators, and
 /// resolving all '.' and '..' components.
 ///
-/// Fail-closed: If the path contains null bytes, exceeds symlink recursion limit,
-/// or cannot be unambiguously resolved, an error is returned.
+/// # Security Contract & Case/Unicode Invariance
+///
+/// Policy decisions compare resolved filesystem paths byte-for-byte. Case differences
+/// (e.g., uppercase vs. lowercase) and Unicode normalization forms (e.g., NFC vs. NFD)
+/// are treated as distinct paths and are not folded or converted.
+///
+/// This design decision is only safe on a filesystem with the exact same behavior (i.e.,
+/// case-sensitive and non-normalizing/non-folding filesystems like Linux ext4). On a
+/// case-insensitive or Unicode normalization-folding filesystem, an attacker could request
+/// an alternate casing or normalization variant of a denied path (e.g., `<root>/SECRET/k.txt`
+/// or an NFD spelling of an NFC directory), and if the policy engine does not fold names,
+/// the request could match an Allow rule and open the denied file.
+///
+/// Therefore, Agnes requires and enforces at startup that configured sandbox roots reside
+/// strictly on case-sensitive, non-folding filesystems.
+///
+/// # Fail-closed
+///
+/// If the path contains null bytes, exceeds symlink recursion limit, contains leading/trailing
+/// whitespace, or cannot be unambiguously resolved, an error is returned.
 pub fn resolve_real_path(raw_path: &str) -> Result<PathBuf, Error> {
     #[cfg(feature = "test-hooks")]
     RESOLUTION_COUNT.with(|c| c.set(c.get() + 1));
@@ -172,15 +190,33 @@ fn resolve_real_path_bounded(path: &Path, depth: u32) -> Result<PathBuf, Error> 
             }
         }
 
-        if let Some(name) = existing_ancestor.file_name() {
-            trailing_components.push(name.to_os_string());
-            if let Some(parent) = existing_ancestor.parent() {
-                existing_ancestor = parent;
-            } else {
-                break;
+        let last_comp = existing_ancestor.components().next_back();
+        match last_comp {
+            Some(Component::Normal(name)) => {
+                trailing_components.push(name.to_os_string());
+                if let Some(parent) = existing_ancestor.parent() {
+                    existing_ancestor = parent;
+                } else {
+                    break;
+                }
             }
-        } else {
-            break;
+            Some(Component::CurDir) => {
+                trailing_components.push(std::ffi::OsString::from("."));
+                if let Some(parent) = existing_ancestor.parent() {
+                    existing_ancestor = parent;
+                } else {
+                    break;
+                }
+            }
+            Some(Component::ParentDir) => {
+                trailing_components.push(std::ffi::OsString::from(".."));
+                if let Some(parent) = existing_ancestor.parent() {
+                    existing_ancestor = parent;
+                } else {
+                    break;
+                }
+            }
+            _ => break,
         }
     }
 
@@ -311,4 +347,30 @@ mod tests {
         assert_eq!(res_dot, res_clean);
         assert_eq!(res_slash, res_clean);
     }
+
+    #[test]
+    fn test_resolve_real_path_nonexistent_tail_with_dot_and_parent_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let existing_root = temp.path().canonicalize().unwrap();
+
+        // The directory 'ghost_dir' does NOT exist on disk.
+        // The components 'ghost_dir/../nonexistent_leaf.txt' are entirely in the non-existent tail.
+        let path_with_parent = existing_root.join("ghost_dir/../nonexistent_leaf.txt");
+        let path_clean = existing_root.join("nonexistent_leaf.txt");
+
+        let resolved_parent = resolve_real_path(path_with_parent.to_str().unwrap()).unwrap();
+        assert_eq!(
+            resolved_parent, path_clean,
+            "Parent directory '..' in non-existent tail must be collapsed by normalizer"
+        );
+
+        // Dot segments '.' and multiple '..' in the non-existent tail
+        let path_with_dots = existing_root.join("ghost_dir/./sub_ghost/./../../nonexistent_leaf.txt");
+        let resolved_dots = resolve_real_path(path_with_dots.to_str().unwrap()).unwrap();
+        assert_eq!(
+            resolved_dots, path_clean,
+            "Current directory '.' and parent directory '..' in non-existent tail must be normalized"
+        );
+    }
 }
+

@@ -1,3 +1,6 @@
 pub mod filesystem;
 
-pub use filesystem::{EnforcementResult, FilesystemEnforcer};
+pub use filesystem::{
+    detect_filesystem_folding, DefaultFilesystemFoldingProbe, EnforcementResult, FilesystemEnforcer,
+    FilesystemFoldingProbe,
+};
