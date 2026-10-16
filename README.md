@@ -1,265 +1,274 @@
-# Project Agnes Firewall for Autonomous AI Agents
+# Project Agnes
 
-> **Status: work in progress (v0.1, pre-release).** Agnes is under active development and is **not production-ready**. Only filesystem reads are enforced end to end today, and the HTTP API has no authentication yet. See [What works today](#what-works-today), [What does not work yet](#what-does-not-work-yet), and the [Roadmap](#roadmap).
+A runtime firewall for autonomous AI agents, written in Rust.
 
-**Project Agnes** is a runtime security firewall for autonomous AI agents, written in Rust. It sits between an agent and the host, evaluates every requested action against a deterministic policy, and enforces the decision before the action reaches the filesystem, network, tools, MCP servers, or external APIs.
+> **Status: work in progress (v0.1, pre release).** Agnes is not production ready. Only filesystem reads are enforced end to end, and the HTTP gateway has no authentication yet. Read [What does not work yet](#what-does-not-work-yet) before running it anywhere.
 
----
+Agnes sits between an agent and the host machine. Every action the agent requests is checked against a deterministic policy, and the decision is enforced before the action touches the filesystem, network, tools, or external APIs. No language model is involved in any decision.
 
 ## Contents
 
-- [What works today](#what-works-today)
-- [What does not work yet](#what-does-not-work-yet)
-- [Architecture](#architecture)
-- [Guarantees and their limits](#guarantees-and-their-limits)
-- [Tests and proof](#tests-and-proof)
-- [Roadmap](#roadmap)
-- [Repository structure](#repository-structure)
-- [Getting started](#getting-started)
-- [Configuration](#configuration)
-- [HTTP API](#http-api)
-- [License](#license)
-
----
+* [What works today](#what-works-today)
+* [What does not work yet](#what-does-not-work-yet)
+* [How a request is handled](#how-a-request-is-handled)
+* [Rule precedence](#rule-precedence)
+* [Guarantees and their limits](#guarantees-and-their-limits)
+* [Tests and proof](#tests-and-proof)
+* [Concepts used](#concepts-used)
+* [Roadmap](#roadmap)
+* [Repository layout](#repository-layout)
+* [Getting started](#getting-started)
+* [Configuration](#configuration)
+* [HTTP API](#http-api)
+* [License](#license)
 
 ## What works today
 
 | Capability | Status |
 |---|---|
-| **Deterministic policy engine**: priority-ordered rules, Deny wins ties, no LLM in the decision loop | Working |
-| **Fail-closed default-deny**: no matching rule, resolution error, evaluation panic, or poisoned lock all result in Deny | Working |
-| **Rules with empty patterns match nothing**: an empty agent, action list, or resource pattern never means "match everything" | Working |
-| **Real-path policy evaluation**: paths are resolved once per request, following symlinks, *before* any rule is checked. Empty paths, null bytes, symlink loops, and leading or trailing whitespace are rejected | Working |
-| **Kernel-confined file reads** (Linux): `openat2` with `RESOLVE_BENEATH`, plus a post-open check that the file actually opened is the exact file the policy approved | Working |
-| **TOCTOU defence for reads**: a symlink, file, or directory swapped between the policy check and the open is detected and blocked | Working (see [limits](#guarantees-and-their-limits)) |
-| **Configurable sandbox roots**: the gateway reads `AGNES_SANDBOX_ROOTS` at startup and starts with no roots (all reads denied) if the setting is missing or invalid | Working |
-| **Structured audit events**: every request produces a correlation-tagged JSON event with decision, matched policy and rule, enforcement action, and observed result | Working (in-memory and log output) |
-| **HTTP gateway** (`agnes-core`): register policies, submit actions, query events and session state | Working (unauthenticated, see below) |
+| Deterministic policy engine with priority, specificity, and Deny wins ties | Working |
+| Default deny: no matching rule, an evaluation error, a panic, or a poisoned lock all produce Deny | Working |
+| Rules with an empty agent, action list, or resource pattern match nothing | Working |
+| Real path resolution before any rule runs: symlinks followed, `..` removed, bad input rejected | Working |
+| Rule patterns resolved once, when the policy is loaded, not on every request | Working |
+| Atomic policy loading: one bad rule rejects the entire policy | Working |
+| Kernel confined file reads on Linux using `openat2` with `RESOLVE_BENEATH` | Working |
+| Check after opening that the file opened is exactly the file the policy approved | Working |
+| Sandbox roots set through `AGNES_SANDBOX_ROOTS`, with no roots registered on any invalid value | Working |
+| Structured audit events with a correlation id, decision, matched rule, and observed result | Working, in memory and in logs |
+| HTTP gateway (`agnes-core`) for policies, actions, events, and session state | Working, unauthenticated |
 
 ## What does not work yet
 
-Being explicit about this is deliberate.
+Only `ReadFile` is enforced end to end. This list is deliberate, so nobody has to guess.
 
-- **Only `ReadFile` is enforced end to end.** Other action types (`WriteFile`, `ExecuteProcess`, `NetworkConnect`, `HttpRequest`, `CallTool`, `CallMcpTool`, `ReadSecret`, and so on) go through the policy engine and default-deny, but the enforcement step is a stub: an Allow returns "Execution permitted" without a real enforcement gate behind it. Real enforcement is planned in Milestone 2.
-- **No authentication or agent identity.** `POST /v1/policies` and `POST /v1/action` are open. Anyone who can reach the gateway can register policies. **Do not expose the gateway to untrusted networks or to the agents it governs.** Planned in Milestone 3.
-- **No mandatory interception.** Agents must route requests through Agnes; nothing forces them to yet. Planned in Milestone 4.
-- **In-memory state only.** The PostgreSQL schema in `infra/postgres` is not wired into the gateway. Events, sessions, and policies are lost on restart.
-- **Linux only** for kernel confinement. Non-Linux platforms use a weaker fallback.
-- **No hot-reload semantics, rate limiting, or reasoning layer** yet.
-- **Rule patterns are still re-resolved on each evaluation**, and a pattern such as `/allowed/link/*` expands through symlinks during matching. Both are scheduled for the rule-precedence work in Milestone 1.
+* **Other action types are not enforced.** `WriteFile`, `ExecuteProcess`, `NetworkConnect`, `HttpRequest`, `CallTool`, `CallMcpTool`, and `ReadSecret` go through the policy engine and default deny, but the enforcement step is a stub. An Allow returns "Execution permitted" and nothing is actually gated. Planned for Milestone 2.
+* **No authentication.** `POST /v1/policies` and `POST /v1/action` are open. Anyone who can reach the gateway can register an allow everything policy. Run it on localhost or an isolated network only, and never expose it to the agents it governs. Planned for Milestone 3.
+* **No mandatory interception.** An agent has to choose to send requests through Agnes. Nothing forces it. Planned for Milestone 4.
+* **State is in memory.** Policies, events, and sessions are lost on restart. The PostgreSQL schema in `infra/postgres` is not connected.
+* **Linux only** for kernel confinement. Other platforms use a weaker fallback.
+* **A poisoned policy lock denies everything** until an operator calls `clear()`, and `clear()` also removes every loaded policy.
+* **Patterns follow the filesystem as it was at load time.** A rule pattern is resolved when the policy is loaded. If a symlink in the pattern is later repointed, the rule stays bound to the original location. A pattern for a directory that does not exist yet is stored as written.
+* **Trailing star patterns match by string prefix.** A pattern such as `/data*` also matches `/database/file`. Use `/data/*` for directory scope.
+* **In place changes to an approved file are not detected.** The check after opening confirms which file was opened, not that its contents are unchanged.
+* **No hot reload rules, rate limiting, case folding rules, or reasoning layer** yet.
 
----
-
-## Architecture
+## How a request is handled
 
 ```
-+----------------------------------------------------------------+
-|               Untrusted input / web content / prompts          |
-+----------------------------------------------------------------+
-                               |
-                               v
-+----------------------------------------------------------------+
-|                     Autonomous AI agent                        |
-+----------------------------------------------------------------+
-                               | (action request)
-                               v
-+================================================================+
-|                       PROJECT AGNES                            |
-|  1. Resolve real path once (symlinks followed, fail-closed)    |
-|  2. Deterministic policy evaluation (default-deny)             |
-|  3. Kernel-confined open (openat2 RESOLVE_BENEATH)             |
-|  4. Post-open verification (opened file == approved file)      |
-|  5. Structured audit event                                     |
-+================================================================+
-                               |
-          +--------------------+--------------------+
-          | Allow and verified                      | Deny / blocked
-          v                                         v
-+--------------------+                     +--------------------+
-| Filesystem (today) |                     | 403 Forbidden /    |
-| other targets (WIP)|                     | action blocked     |
-+--------------------+                     +--------------------+
+Agent action request
+        |
+        v
+1. Resolve the real path once (symlinks followed, bad input rejected)
+        |
+        v
+2. Evaluate policy (priority, specificity, Deny wins ties, default deny)
+        |
+        v
+3. Open the file with openat2 and RESOLVE_BENEATH inside a sandbox root
+        |
+        v
+4. Compare the opened file (/proc/self/fd) with the approved path
+        |
+        v
+5. Return the content, or block, and write an audit event
 ```
 
----
+A failure at any step ends in a block with no file content returned.
+
+## Rule precedence
+
+When several rules match a request, the engine sorts them and takes the first one:
+
+1. **Priority**, highest number first.
+2. **Specificity**, when priorities are equal. An exact path beats a wildcard. A deeper directory beats a shallower one. A longer prefix beats a shorter one. A lone `*` is least specific.
+3. **Decision**, when priority and specificity are equal. Deny beats Allow.
+4. **Policy id, then rule id**, so the result is identical on every run.
+
+One consequence to know about: at equal priority an exact path rule beats a wildcard rule whatever its decision. An exact Allow on `/data/report.txt` beats a Deny on `/data/*` if both have priority 10. Give the Deny a higher priority if that is not what you want.
 
 ## Guarantees and their limits
 
-Agnes aims to state exactly what it guarantees, and no more.
-
 | Threat | What Agnes does | Known limit |
 |---|---|---|
-| Path traversal (`../`) | Lexical normalisation plus `RESOLVE_BENEATH` | Linux only |
-| Symlink escape, including chained symlinks and loops | Policy is evaluated against the fully resolved real path; loops fail closed; the kernel also confines the open | Rule patterns that point through symlinked directories are expanded during matching (to be settled in Milestone 1) |
-| Symlink swapped after the policy check (TOCTOU) | The post-open check compares the opened file (`/proc/self/fd`) to the exact approved path. Any mismatch is blocked. Swapping the approved file itself, or a directory in its path, is also caught | In-place content changes to the approved file are out of scope; a deleted or renamed target fails closed |
-| Whitespace, null-byte, and control-character tricks | Rejected before policy evaluation (fail closed, never trimmed) | - |
-| Duplicate path resolution drift | Each path is resolved exactly once per request and the same string is used by every later stage | - |
-| Rules with empty patterns | Match nothing | - |
-| Evaluation error, panic, or poisoned lock | Caught and converted to Deny, including a poisoned sandbox-root lock in the enforcer | A poisoned policy lock denies everything until an operator calls `clear()`, which also removes all loaded policies |
-| Missing or invalid sandbox-root configuration | The gateway registers no roots at all and every file read is denied | - |
-
----
+| Path traversal with `../` | Lexical cleanup plus `RESOLVE_BENEATH` | Linux only |
+| Symlink escape, chained links, loops | Policy sees the fully resolved path. Loops fail closed. The kernel also confines the open | None known |
+| Link swapped after the policy check | The opened file is compared with the approved path. A swapped link, a swapped approved file, and a swapped directory are all blocked | Content changes inside the approved file are out of scope |
+| Spaces, null bytes, control characters in a path | Rejected before evaluation, never trimmed | None known |
+| Policy and enforcement disagreeing about a path | Each path is resolved once and the same string is used by every later step | None known |
+| A rule silently dropped because its pattern is bad | The whole policy is rejected, nothing is loaded, earlier policies stay in force, and the API returns 400 | None known |
+| Rules with empty patterns | Match nothing | None known |
+| Panic, error, or poisoned lock during evaluation | Caught and turned into Deny. A poisoned lock in the enforcer also becomes a controlled block | A poisoned policy lock needs `clear()` to recover |
+| Missing or invalid sandbox root setting | No roots registered, every file read denied | None known |
 
 ## Tests and proof
 
-As of commit `af59d04`, run as a normal (non-root) user:
+As of commit `c086fde`, run as an unprivileged user:
 
 ```
-agnes-policy                      unit tests ...........................  14 passed
-agnes-enforcement                 unit tests ...........................   1 passed
-agnes-core (gateway)              unit tests ...........................   2 passed
-adversarial_bypass_002 ................................................   4 passed
-adversarial_filesystem_fuzzing ........................................   1 passed
-regression_filesystem_boundary ........................................  27 passed
-test_001_and_002 ......................................................   2 passed
--------------------------------------------------------------------------------------
-TOTAL                                                                     51 passed, 0 failed
+agnes-policy unit tests ............................ 15 passed
+agnes-enforcement unit tests ........................  1 passed
+agnes-core gateway tests ............................  3 passed
+adversarial_bypass_002 ..............................  4 passed
+adversarial_filesystem_fuzzing ......................  1 passed
+regression_filesystem_boundary ...................... 36 passed
+test_001_and_002 ....................................  2 passed
+--------------------------------------------------------------
+TOTAL                                                62 passed, 0 failed
 ```
 
 Reproduce it:
 
 ```bash
 cargo test --workspace
-```
-
-`test_regression_014_permission_changes_after_policy` changes file permissions and must run as a non-root user, because root ignores `chmod 000`.
-
-To see the per-suite summary lines yourself:
-
-```bash
 cargo test --workspace 2>&1 | grep -E "Running|test result"
 ```
+
+`test_regression_014_permission_changes_after_policy` changes file permissions, so it must run as a normal user. The root user ignores `chmod 000`.
 
 ### What the regression suite covers
 
 | Tests | Threat |
 |---|---|
-| `REGRESSION-001`, `003`, `004`, `005`, `006`, `012`, `013` | Path traversal, nested traversal, alternate representations, relative and absolute paths outside the sandbox root |
-| `REGRESSION-002`, `007`, `011`, `025`, `adversarial_bypass_002` | Symlink escapes, chained and nested symlinks, symlink loops |
-| `REGRESSION-008`, `009`, `010`, `014`, `015`, `018`, `019` | TOCTOU: symlink created after policy, directory rename, file replaced by symlink, permission change, concurrent race, approved file swapped for a symlink |
-| `REGRESSION-016` | Whitespace in paths cannot make policy and enforcement disagree |
-| `REGRESSION-017` (two tests) | A path is resolved exactly once per request, and stays atomic if the filesystem changes mid-evaluation |
-| `REGRESSION-020`, `021`, `022` | Default-deny: zero matching rules, malformed policy config, evaluation panic |
-| `REGRESSION-023`, `024` | A failed config load leaves existing policies untouched; empty patterns and invalid paths are denied |
-| Gateway tests (`agnes-core`) | A read inside a configured sandbox root succeeds and returns the file contents; a read outside is blocked with no output; every invalid `AGNES_SANDBOX_ROOTS` value registers no roots |
-| `adversarial_filesystem_fuzzing` | Fuzzed malformed, oversized, and unusual paths |
+| REGRESSION 001, 003, 004, 005, 006, 012, 013 | Path traversal, nested traversal, alternate spellings, paths outside the sandbox |
+| REGRESSION 002, 007, 011, 025 and `adversarial_bypass_002` | Symlink escapes, chained and nested links, symlink loops |
+| REGRESSION 008, 009, 010, 014, 015, 018, 019 | Races after the policy check: link created late, directory renamed, file replaced by a link, permission change, concurrent race, approved file swapped for a link |
+| REGRESSION 016 | Spaces in a path cannot make policy and enforcement disagree |
+| REGRESSION 017 (two tests) | A path is resolved exactly once, and stays consistent if the filesystem changes mid evaluation |
+| REGRESSION 020, 021, 022 | Default deny: no matching rule, malformed policy file, panic during evaluation |
+| REGRESSION 023, 024 | A failed policy load changes nothing. Empty patterns and invalid paths are denied |
+| REGRESSION 026 | Precedence: deny inside allow, allow inside deny, equal conflicts, tie breaks |
+| REGRESSION 027 | Rule patterns that go through symlinks are bound to the real location at load time |
+| REGRESSION 028 and 029 (six tests) | Any rule with a bad pattern rejects the whole policy: leading space, trailing space, symlink loop, null byte, a bad last rule, and an earlier valid policy staying in force |
+| Gateway tests | A read inside a sandbox root works, a read outside is blocked, every invalid `AGNES_SANDBOX_ROOTS` value registers nothing, and `POST /v1/policies` returns 400 for a bad policy and registers nothing |
+| `adversarial_filesystem_fuzzing` | Malformed, oversized, and unusual paths |
 
-### How the tests are verified
+### How the tests were checked
 
-Every fix ships with a regression test, and each test is checked by breaking the fix on purpose and confirming the test fails. A test that cannot fail proves nothing.
+A test that cannot fail proves nothing. For each fix, the fix was broken on purpose and the test was confirmed to fail.
 
-| Fix | How it was deliberately broken | Result |
+| Fix | How it was broken | What failed |
 |---|---|---|
-| Real-path resolution (symlink escape) | Pre-fix code restored | New regression test fails |
-| Whitespace mismatch (`REGRESSION-016`) | Trimming restored | Test fails |
-| Single resolution per request (`REGRESSION-017`) | Duplicate resolution reintroduced in the rule matcher | Both tests fail (resolution count 4 instead of 1; mid-evaluation swap returns Deny instead of Allow) |
-| Post-open TOCTOU check (`REGRESSION-018`) | Pre-fix enforcer restored | Test fails |
-| Canonicalize-fallback bypass (`REGRESSION-019`) | Previous enforcer restored | Test fails with "approved file was replaced by symlink" |
-| Default-deny for zero matching rules | Default branch flipped to Allow | `REGRESSION-020`, `024`, and the inline test fail |
-| Poisoned policy lock | Deny branch flipped to Allow | Inline test fails on its first assertion |
-| Empty-pattern rules | Old matching restored | Inline empty-pattern test fails |
-| Enforcer lock handling | `.expect()` restored | Enforcer test panics |
-| Path-resolution failure and symlink loops | Failure branch flipped to Allow | Loop test and invalid-path test fail |
-| Sandbox-root config: all-or-nothing | Valid roots registered before a later entry fails | Config test fails |
-| Sandbox-root config: absolute paths only | Relative-path check removed | Config test fails on the `.` case |
+| Real path resolution | Code from before the fix restored | The new regression test |
+| Spaces in paths (016) | Trimming restored | The test |
+| One resolution per request (017) | Second resolution added to the rule matcher | Both tests: resolution count 4 instead of 1, and a mid evaluation swap returned Deny instead of Allow |
+| Check after opening (018) | Previous enforcer restored | The test |
+| Canonicalize fallback bypass (019) | Previous enforcer restored | The test, with "approved file was replaced by symlink" |
+| Default deny for no match | Branch changed to Allow | 020, 024, and the inline test |
+| Poisoned policy lock | Branch changed to Allow | The inline test, on its first assertion |
+| Empty pattern rules | Old matching restored | The inline test |
+| Enforcer lock handling | `.expect()` put back | The enforcer test panicked |
+| Path resolution failure and loops | Branch changed to Allow | Loop test and invalid path test |
+| Sandbox roots all or nothing | Valid roots registered before a later entry fails | The config test |
+| Sandbox roots must be absolute | Absolute path check removed | The config test, on the `.` case |
+| Specificity in the sort | Removed from the sort | Test 026 |
+| Pattern resolved at load time | Resolution turned into a no op | Test 027 |
+| Deny wins ties | Tie break reversed | Test 026 |
+| Atomic policy load | Errors ignored, then bad rules dropped like the old behavior | Nine tests in each case |
 
-Other checks:
+Other checks that mattered:
 
-- **A first version of a test was rejected for passing against both old and new code.** The single-resolution "atomic" test was rewritten to repoint a symlink mid-evaluation, so it now fails against the old behaviour.
-- **A bypass was found and closed during review.** An early version of the TOCTOU check re-resolved the approved path from disk, which let an attacker swap the approved file itself into a symlink to a denied file. That fallback is removed (`REGRESSION-019`).
-- **No test scaffolding in production builds.** Test-only counters and hooks are gated behind the `test-hooks` Cargo feature. Calling them without the feature fails to compile.
-- **No panics in non-test code.** A search of `apps/` and every crate finds no `unwrap`, `expect`, or `panic!` outside tests.
+* **A weak test was rejected.** The first version of the single resolution test passed on both old and new code, so it was rewritten to repoint a symlink during evaluation.
+* **A bypass was found in review.** An early version of the post open check re resolved the approved path from disk. An attacker could replace the approved file with a link to a denied file and both sides resolved to the same place. The fallback was removed (REGRESSION 019).
+* **A silent policy weakening was found in review.** A rule with an unresolvable pattern used to be dropped while the rest of the policy loaded. A Deny rule with a leading space in its pattern disappeared and a broad Allow let a secret file be read. The whole policy is now rejected (REGRESSION 028 and 029).
+* **Test code stays out of production builds.** Counters and hooks used by tests sit behind the `test-hooks` Cargo feature. Calling them without the feature fails to compile.
+* **No panics outside tests.** A search of `apps/` and every crate finds no `unwrap`, `expect`, or `panic!` in non test code.
 
-Engineering rules for contributors are in [`skills.md`](skills.md). Threat models and experiment reports are in [`docs/`](docs/).
+The engineering rules every change must follow are in [`skills.md`](skills.md). Threat models and experiment reports are in [`docs/`](docs/).
 
----
+## Concepts used
+
+* **Default deny and failing closed.** Anything unknown, ambiguous, or broken becomes a denial, never a permission.
+* **Canonicalization.** The path used for a decision is the real path on disk, after symlinks and `..` are resolved, so a clever spelling cannot change the outcome.
+* **TOCTOU (time of check to time of use).** The gap between checking a file and opening it is the attack window. Agnes closes it by opening inside a kernel enforced boundary and then verifying what was actually opened.
+* **`openat2` with `RESOLVE_BENEATH`.** A Linux system call that makes the kernel refuse any path that escapes a directory, including through symlinks.
+* **`/proc/self/fd` verification.** After opening, the real path of the open file descriptor is read back and compared with the path the policy approved.
+* **Deterministic rule ordering.** Priority, then specificity, then Deny before Allow, then ids. The same input always gives the same decision.
+* **Atomic loading.** A policy is validated completely before any state changes, so a failure leaves nothing half applied.
+* **Load time resolution.** Rule patterns are resolved once when the policy is loaded, which removes repeated resolution on every request.
+* **Panic containment.** `catch_unwind` around evaluation, and recovery handling for poisoned locks, so internal failures become Deny.
+* **Regression testing with mutation checks.** Every fix has a test, and the test is proven by breaking the fix.
+* **Fuzzing.** Generated malformed and oversized paths are fed through the full path.
+* **Feature gated test hooks.** Test only instrumentation uses thread local state behind a Cargo feature.
+* **Structured audit events.** Each request carries a correlation id from request to decision to result.
+* **Rust building blocks.** Axum for the gateway, Serde for policy and request JSON, Tokio for async, `thiserror` for typed errors, Tracing for logs.
 
 ## Roadmap
 
 | Milestone | Focus | Status |
 |---|---|---|
-| 1 | Core policy correctness (path resolution, TOCTOU, default-deny, rule precedence, fuzzing) | **In progress (prompts 1-4 of 14 complete)** |
-| 2 | Enforcement completeness (writes, processes, network, tools, MCP) | Planned |
+| 1 | Core policy correctness: path resolution, races, default deny, rule precedence, fuzzing | In progress, prompts 1 to 5 of 14 done |
+| 2 | Enforcement for writes, processes, network, tools, and MCP | Planned |
 | 3 | Identity and authentication | Planned |
 | 4 | Mandatory interception | Planned |
 | 5 | Observability and traceability | Planned |
 | 6 | Reasoning layer | Planned |
 
----
-
-## Repository structure
+## Repository layout
 
 ```
-├── apps/
-│   ├── agnes-core/       # Axum HTTP gateway, state coordinator, enforcement dispatcher
-│   └── mock-agent/       # Deterministic action generator for security experiments
-├── crates/
-│   ├── common/           # Typed action schemas, decisions, events
-│   ├── policy/           # Policy engine, path resolution
-│   ├── enforcement/      # Filesystem enforcement (Linux openat2 confinement)
-│   ├── state/            # Session coordinator, audit event history
-│   └── telemetry/        # JSON logger and in-memory event sinks
-├── infra/                # Docker, Postgres schema (not yet wired in), mock targets
-├── docs/                 # Threat models, experiment reports, findings
-├── skills.md             # Engineering rules for every change
-└── tests/                # Integration, fuzzing, adversarial, and regression tests
+apps/
+  agnes-core/     Axum HTTP gateway, state coordinator, enforcement dispatcher
+  mock-agent/     Deterministic action generator for experiments
+crates/
+  common/         Typed actions, decisions, and events
+  policy/         Policy engine, path resolution, rule model, load errors
+  enforcement/    Filesystem enforcement with Linux openat2 confinement
+  state/          Session coordinator and audit event history
+  telemetry/      JSON logger and in memory event sinks
+infra/            Docker files, Postgres schema (not connected), mock targets
+docs/             Threat models, experiment reports, findings
+skills.md         Engineering rules for every change
+tests/            Integration, fuzzing, adversarial, and regression tests
 ```
-
-## Prerequisites
-
-- **Rust 1.77 or newer** (declared as `rust-version` in `Cargo.toml`; 1.80+ recommended)
-- **Linux** for kernel boundary confinement
-- Docker and Docker Compose (optional)
 
 ## Getting started
 
-```bash
-cargo test --workspace                                      # run the test suite
+Requirements: Rust 1.77 or newer (1.80 or newer recommended), Linux for kernel confinement, and optionally Docker with Docker Compose.
 
-AGNES_SANDBOX_ROOTS=/path/to/sandbox cargo run -p agnes-core   # start the gateway on http://0.0.0.0:8080
-cargo run -p mock-agent                                     # in a second terminal
+```bash
+cargo test --workspace
+
+AGNES_SANDBOX_ROOTS=/path/to/sandbox cargo run -p agnes-core
+cargo run -p mock-agent
 ```
 
-> The gateway has no authentication. Run it on localhost or an isolated network only.
+The gateway listens on `http://0.0.0.0:8080`. It has no authentication, so keep it on localhost or an isolated network.
 
-### Docker Compose
+With Docker:
 
 ```bash
 docker compose up --build
 ```
 
-The compose file mounts a volume at `/sandbox` but does not set `AGNES_SANDBOX_ROOTS` yet. Add this line under the `agnes-core` service's `environment:` block, or file reads will be denied:
-
-```yaml
-AGNES_SANDBOX_ROOTS: /sandbox
-```
+The `agnes-core` service needs `AGNES_SANDBOX_ROOTS` set, for example `AGNES_SANDBOX_ROOTS: /sandbox` in its `environment` block. Without it, every file read is denied.
 
 ## Configuration
 
-| Variable | Purpose | Default |
+| Variable | Meaning | Default |
 |---|---|---|
-| `AGNES_SANDBOX_ROOTS` | Colon-separated list of absolute directories the gateway may read from | Unset: no roots, every file read is denied |
+| `AGNES_SANDBOX_ROOTS` | Colon separated list of absolute directories the gateway may read from | Unset, so no roots and every file read is denied |
 
-Validation is all-or-nothing. If any entry is empty (leading, trailing, or doubled colon), relative (`.`, `..`, `dir/sub`), missing, not a directory, or `/`, the gateway logs an error and registers **no** roots. It never defaults to `/` or the current directory.
+Validation is all or nothing. If any entry is empty (a leading, trailing, or doubled colon), relative (`.`, `..`, `dir/sub`), missing, not a directory, or `/`, the gateway logs an error and registers no roots at all. It never falls back to `/` or the current directory.
 
 ## HTTP API
 
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | Health check |
-| `POST /v1/policies` | Register a policy (unauthenticated) |
+| `POST /v1/policies` | Register a policy. Returns 201, or 400 if any rule is invalid |
 | `POST /v1/action` | Submit an agent action for evaluation and enforcement |
-| `GET /v1/events` | Chronological audit events |
+| `GET /v1/events` | Audit events in order |
 | `GET /v1/state/{agent_id}` | Session statistics for an agent |
 
-Enum values are upper snake case (`ALLOW`, `DENY`, `READ_FILE`).
+Enum values are upper snake case, for example `ALLOW`, `DENY`, and `READ_FILE`.
 
-**Register a policy**
+Register a policy:
 
 ```json
 {
   "id": "policy-sandbox-read",
-  "name": "Allow Read Operations in Sandbox",
+  "name": "Allow reads inside the sandbox",
   "version": 1,
   "rules": [
     {
@@ -272,21 +281,33 @@ Enum values are upper snake case (`ALLOW`, `DENY`, `READ_FILE`).
       "priority": 10
     },
     {
-      "id": "rule-deny-etc",
-      "description": "Deny reads from /etc",
+      "id": "rule-deny-private",
+      "description": "Deny reads inside /sandbox/private",
       "decision": "DENY",
       "agent_pattern": "*",
       "action_types": ["READ_FILE"],
-      "resource_pattern": "/etc/*",
-      "priority": 100
+      "resource_pattern": "/sandbox/private/*",
+      "priority": 10
     }
   ]
 }
 ```
 
-A rule with an empty `agent_pattern`, an empty `action_types` list, or an empty `resource_pattern` matches nothing.
+Here both rules have priority 10, so the deeper `/sandbox/private/*` rule wins for files inside it.
 
-**Submit an action**
+A rule with an empty `agent_pattern`, an empty `action_types` list, or an empty `resource_pattern` is not a catch all. An empty pattern is rejected when the policy loads. If any pattern cannot be resolved, the response is `400` and nothing from that policy is loaded:
+
+```json
+{
+  "error": "Failed to register policy",
+  "details": "Failed to load policy 'p1': rule 'r2' has invalid or unresolvable pattern: ...",
+  "policy_id": "p1",
+  "rule_id": "r2",
+  "reason": "..."
+}
+```
+
+Submit an action:
 
 ```json
 {
@@ -299,8 +320,8 @@ A rule with an empty `agent_pattern`, an empty `action_types` list, or an empty 
 }
 ```
 
-A denied or blocked action returns HTTP `403` with `decision: "DENY"` or `observed_result: "BLOCKED_BY_FIREWALL"`.
+A denied or blocked action returns HTTP `403` with `decision` set to `DENY` or `observed_result` set to `BLOCKED_BY_FIREWALL`.
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
