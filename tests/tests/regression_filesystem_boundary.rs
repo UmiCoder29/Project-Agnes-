@@ -1194,6 +1194,48 @@ fn test_regression_024_adversarial_empty_patterns_and_invalid_paths_denied() {
     assert_eq!(harness.policy_engine.evaluate(&req_null).decision, Decision::Deny);
 }
 
+// REGRESSION-025: Symlink loop target resolution failure resolves to Deny.
+#[test]
+fn test_regression_025_symlink_loop_resolves_to_deny() {
+    let harness = SecurityTestHarness::new();
+    let temp = tempfile::tempdir().unwrap();
+    let loop_a = temp.path().join("loop_a");
+    let loop_b = temp.path().join("loop_b");
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&loop_b, &loop_a).unwrap();
+        std::os::unix::fs::symlink(&loop_a, &loop_b).unwrap();
+    }
+
+    // Allow-all policy: will match and allow if resolution error doesn't fail closed
+    let policy = Policy::new("policy-allow-all", "Allow all", 1).with_rule(PolicyRule {
+        id: "rule-allow".to_string(),
+        description: "Allow all".to_string(),
+        decision: Decision::Allow,
+        agent_pattern: "*".to_string(),
+        action_types: vec![ActionType::ReadFile],
+        resource_pattern: "*".to_string(),
+        priority: 10,
+    });
+    harness.policy_engine.add_policy(policy);
+
+    let req = ActionRequest::new(
+        "agent-001",
+        ActionPayload::ReadFile {
+            path: loop_a.to_string_lossy().to_string(),
+        },
+    ).with_test_id("REGRESSION-025-SYMLINK-LOOP");
+
+    let decision = harness.policy_engine.evaluate(&req);
+    assert_eq!(
+        decision.decision,
+        Decision::Deny,
+        "Symlink loop must fail closed to Deny"
+    );
+    assert_eq!(decision.matched_policy_id, "fail-closed-path-resolution");
+}
+
 
 
 

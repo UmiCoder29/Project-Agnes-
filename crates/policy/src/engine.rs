@@ -189,6 +189,11 @@ impl PolicyEngine {
                 .then_with(|| r_a.id.cmp(&r_b.id))
         });
 
+        // Note on unreachability: The None arm below is unreachable in normal execution because
+        // the `if matching_rules.is_empty()` guard above returns early, and in-memory `sort_by` never
+        // mutates vector length or removes elements. We deliberately keep this None arm with an explicit
+        // fallback to fail-closed Deny rather than using `.expect()`, `.unwrap()`, or `unreachable!()`
+        // to uphold Project Agnes Rule 1 (fail-closed defense-in-depth) and eliminate any possibility of a panic.
         let (chosen_policy, chosen_rule) = match matching_rules.first().copied() {
             Some(pair) => pair,
             None => {
@@ -589,6 +594,49 @@ mod tests {
             "Existing policies must remain active after failed load"
         );
         assert_eq!(decision_after.matched_policy_id, "policy-valid");
+    }
+
+    // CASE 8: Symlink loop path resolution failure must resolve to Deny.
+    #[test]
+    fn test_audit_symlink_loop_resolves_to_deny() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let loop_a = temp_dir.path().join("loop_a");
+        let loop_b = temp_dir.path().join("loop_b");
+
+        // Mutual symlink cycle: loop_a -> loop_b, loop_b -> loop_a
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&loop_b, &loop_a).unwrap();
+            std::os::unix::fs::symlink(&loop_a, &loop_b).unwrap();
+        }
+
+        let engine = PolicyEngine::new();
+        // Allow-all rule: if resolution fails open or falls back to raw path, it would Allow
+        let policy = Policy::new("policy-allow-all", "Allow all", 1).with_rule(PolicyRule {
+            id: "rule-allow-all".to_string(),
+            description: "Allow all".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "*".to_string(),
+            priority: 10,
+        });
+        engine.add_policy(policy);
+
+        let req = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: loop_a.to_string_lossy().to_string(),
+            },
+        );
+
+        let decision = engine.evaluate(&req);
+        assert_eq!(
+            decision.decision,
+            Decision::Deny,
+            "Request targeting a symlink loop must resolve to Deny"
+        );
+        assert_eq!(decision.matched_policy_id, "fail-closed-path-resolution");
     }
 }
 

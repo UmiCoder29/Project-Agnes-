@@ -16,7 +16,7 @@ use agnes_policy::{Policy, PolicyEngine};
 use agnes_state::StateEngine;
 use agnes_telemetry::{InMemoryTelemetrySink, StructuredJsonLogSink, TelemetrySink};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
@@ -41,6 +41,75 @@ pub struct GatewayActionResponse {
     pub error_message: Option<String>,
 }
 
+use std::path::{Path, PathBuf};
+
+/// Configures sandbox roots on the given filesystem enforcer.
+///
+/// Follows strict fail-closed requirements:
+/// - Reads a colon-separated list of paths (e.g. from AGNES_SANDBOX_ROOTS).
+/// - Each root must exist and be a directory.
+/// - If the variable is unset, empty, or if ANY entry is invalid (non-existent, regular file,
+///   unresolvable, or root "/"), logs a clear error and registers NO roots (reads stay denied).
+/// - Never defaults to "/" or the current working directory.
+pub fn configure_sandbox_roots(enforcer: &FilesystemEnforcer, roots_env: Option<&str>) -> Vec<PathBuf> {
+    let raw = match roots_env {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => {
+            error!("AGNES_SANDBOX_ROOTS is unset or empty; starting gateway with NO sandbox roots (ReadFile actions will be denied)");
+            return Vec::new();
+        }
+    };
+
+    let entries: Vec<&str> = raw.split(':').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if entries.is_empty() {
+        error!("AGNES_SANDBOX_ROOTS contains no valid path entries; starting gateway with NO sandbox roots");
+        return Vec::new();
+    }
+
+    let mut validated_roots = Vec::new();
+    for entry in &entries {
+        let p = Path::new(entry);
+        let canonical = match p.canonicalize() {
+            Ok(c) => c,
+            Err(err) => {
+                error!(
+                    root = %entry,
+                    error = %err,
+                    "AGNES_SANDBOX_ROOTS entry does not exist or failed to resolve; starting gateway with NO sandbox roots"
+                );
+                return Vec::new();
+            }
+        };
+
+        if !canonical.is_dir() {
+            error!(
+                root = %entry,
+                canonical = %canonical.display(),
+                "AGNES_SANDBOX_ROOTS entry is not a directory; starting gateway with NO sandbox roots"
+            );
+            return Vec::new();
+        }
+
+        // Explicit security rule: never allow root directory "/"
+        if canonical == Path::new("/") {
+            error!(
+                root = %entry,
+                "AGNES_SANDBOX_ROOTS entry cannot be root directory '/'; starting gateway with NO sandbox roots"
+            );
+            return Vec::new();
+        }
+
+        validated_roots.push(canonical);
+    }
+
+    for root in &validated_roots {
+        info!(root = %root.display(), "Registered gateway sandbox root");
+        enforcer.register_sandbox_root(root);
+    }
+
+    validated_roots
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
@@ -50,10 +119,14 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting Project Agnes Runtime Security Core v0.1");
 
+    let fs_enforcer = FilesystemEnforcer::new();
+    let roots_env = std::env::var("AGNES_SANDBOX_ROOTS").ok();
+    configure_sandbox_roots(&fs_enforcer, roots_env.as_deref());
+
     let state = Arc::new(AppState {
         policy_engine: PolicyEngine::new(),
         state_engine: StateEngine::new(),
-        fs_enforcer: FilesystemEnforcer::new(),
+        fs_enforcer,
         memory_sink: InMemoryTelemetrySink::new(),
         log_sink: StructuredJsonLogSink,
     });
@@ -185,4 +258,118 @@ async fn action_handler(
         Decision::Deny => StatusCode::FORBIDDEN,
     };
     (status, Json(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agnes_common::{ActionPayload, ActionRequest, ActionType, Decision, EnforcementAction, ObservedResult};
+    use agnes_policy::{Policy, PolicyRule};
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_gateway_read_inside_configured_root_allowed_and_outside_blocked() {
+        let temp_dir = tempdir().unwrap();
+        let allowed_dir = temp_dir.path().join("allowed_sandbox");
+        let outside_dir = temp_dir.path().join("outside_sandbox");
+        fs::create_dir_all(&allowed_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+
+        let allowed_file = allowed_dir.join("test.txt");
+        let outside_file = outside_dir.join("secret.txt");
+        fs::write(&allowed_file, "AUTHORIZED_GATEWAY_DATA").unwrap();
+        fs::write(&outside_file, "UNAUTHORIZED_OUTSIDE_DATA").unwrap();
+
+        let fs_enforcer = FilesystemEnforcer::new();
+        let roots_str = allowed_dir.to_string_lossy().to_string();
+        let roots = configure_sandbox_roots(&fs_enforcer, Some(&roots_str));
+        assert_eq!(roots.len(), 1);
+
+        let policy_engine = PolicyEngine::new();
+        policy_engine.add_policy(Policy::new("p-allow-all", "Allow all", 1).with_rule(PolicyRule {
+            id: "r-allow".to_string(),
+            description: "Allow".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "*".to_string(),
+            priority: 10,
+        }));
+
+        let state = AppState {
+            policy_engine,
+            state_engine: StateEngine::new(),
+            fs_enforcer,
+            memory_sink: InMemoryTelemetrySink::new(),
+            log_sink: StructuredJsonLogSink,
+        };
+
+        // 1. Read inside configured root: Allowed end to end with content
+        let req_inside = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: allowed_file.to_string_lossy().to_string(),
+            },
+        );
+        let resp_inside = process_action(&state, req_inside).await;
+        assert_eq!(resp_inside.decision, Decision::Allow);
+        assert_eq!(resp_inside.enforcement_action, EnforcementAction::PermitExecution);
+        assert_eq!(resp_inside.observed_result, ObservedResult::AccessSuccess);
+        assert_eq!(resp_inside.output.as_deref(), Some("AUTHORIZED_GATEWAY_DATA"));
+
+        // 2. Read outside configured root: Blocked by firewall
+        let req_outside = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: outside_file.to_string_lossy().to_string(),
+            },
+        );
+        let resp_outside = process_action(&state, req_outside).await;
+        assert_eq!(resp_outside.enforcement_action, EnforcementAction::CanonicalBoundaryViolation);
+        assert_eq!(resp_outside.observed_result, ObservedResult::BlockedByFirewall);
+        assert_eq!(resp_outside.output, None);
+    }
+
+    #[test]
+    fn test_configure_sandbox_roots_fail_closed_validation() {
+        let enforcer = FilesystemEnforcer::new();
+
+        // Unset
+        let roots = configure_sandbox_roots(&enforcer, None);
+        assert!(roots.is_empty());
+
+        // Empty
+        let roots = configure_sandbox_roots(&enforcer, Some(""));
+        assert!(roots.is_empty());
+
+        // Non-existent path
+        let roots = configure_sandbox_roots(&enforcer, Some("/nonexistent_sandbox_dir_xyz_123"));
+        assert!(roots.is_empty());
+
+        // File instead of directory
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("file.txt");
+        fs::write(&file_path, "not a dir").unwrap();
+        let roots = configure_sandbox_roots(&enforcer, Some(&file_path.to_string_lossy()));
+        assert!(roots.is_empty());
+
+        // Root directory "/"
+        let roots = configure_sandbox_roots(&enforcer, Some("/"));
+        assert!(roots.is_empty());
+
+        // Mixed valid and invalid: must start with NO roots (all-or-nothing fail closed)
+        let valid_dir = temp_dir.path().join("valid_dir");
+        fs::create_dir_all(&valid_dir).unwrap();
+        let mixed = format!("{}:/nonexistent_xyz", valid_dir.display());
+        let roots = configure_sandbox_roots(&enforcer, Some(&mixed));
+        assert!(roots.is_empty());
+
+        // Valid multiple colon-separated
+        let valid_dir2 = temp_dir.path().join("valid_dir2");
+        fs::create_dir_all(&valid_dir2).unwrap();
+        let multi = format!("{}:{}", valid_dir.display(), valid_dir2.display());
+        let roots = configure_sandbox_roots(&enforcer, Some(&multi));
+        assert_eq!(roots.len(), 2);
+    }
 }

@@ -2,8 +2,12 @@
 name = "agnes-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
+
+[dev-dependencies]
+tempfile = "3.12"
 
 [dependencies]
 agnes-common = { path = "../../crates/common" }

@@ -2,6 +2,7 @@
 name = "agnes-policy"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 
@@ -19,4 +20,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 agnes-policy = { path = ".", features = ["test-hooks"] }
+tempfile = "3.12"
 
