@@ -26,6 +26,7 @@ const SECRET_CANARY_012: &str = "SECRET_CANARY_012_PARENT_ESC_887";
 const SECRET_CANARY_013: &str = "SECRET_CANARY_013_ALT_PATH_776";
 const SECRET_CANARY_014: &str = "SECRET_CANARY_014_PERM_CHANGE_665";
 const SECRET_CANARY_015: &str = "SECRET_CANARY_015_DEL_RACE_554";
+const SECRET_CANARY_032: &str = "SECRET_CANARY_032_RELATIVE_CLIMB_101";
 
 struct TestEnv {
     _temp: tempfile::TempDir,
@@ -2840,6 +2841,103 @@ fn test_regression_031_filesystem_folding_probe_passes_and_cleans_up() {
         "Probe file must never remain on disk: found {:?}",
         entries
     );
+}
+
+/// REGRESSION-032: Crafted relative paths using `..` segments attempting to climb above the sandbox root
+/// must be rejected before symlink resolution or kernel access, both under default policy and overly broad policy.
+#[test]
+fn test_regression_032_crafted_relative_path_climbing_above_sandbox_root_rejected() {
+    let env = TestEnv::new("reg-032");
+    let forbidden_file = env.forbidden_dir.join("secret.txt");
+    fs::write(&forbidden_file, SECRET_CANARY_032).unwrap();
+
+    let sub_dir = env.allowed_dir.join("sub").join("nested");
+    fs::create_dir_all(&sub_dir).unwrap();
+
+    // 1. Array of crafted relative paths attempting to climb above sandbox root
+    let climbing_relative_vectors = vec![
+        "sub/../../forbidden/secret.txt",
+        "sub/nested/../../../forbidden/secret.txt",
+        "../forbidden/secret.txt",
+        "./sub/../../forbidden/secret.txt",
+        "sub/..//../forbidden/secret.txt",
+        "sub/nested/../../../../forbidden/secret.txt",
+        "sub/nested/./../../..//forbidden/secret.txt",
+        "sub/nested/../../..",
+    ];
+
+    for (idx, crafted_path) in climbing_relative_vectors.iter().enumerate() {
+        let req = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: crafted_path.to_string(),
+            },
+        ).with_test_id(format!("REGRESSION-032-{}", idx));
+
+        let report = env.harness.execute_request(req);
+        assert_ne!(
+            report.observed_result,
+            ObservedResult::AccessSuccess,
+            "Crafted relative path '{}' must NEVER succeed in accessing file",
+            crafted_path
+        );
+        assert_eq!(
+            report.observed_result,
+            ObservedResult::BlockedByFirewall,
+            "Crafted relative path '{}' must be BlockedByFirewall",
+            crafted_path
+        );
+        assert!(
+            !report.logs.contains(SECRET_CANARY_032),
+            "Canary must not be leaked for '{}'",
+            crafted_path
+        );
+    }
+
+    // 2. Test under an overly broad wildcard policy ("*")
+    // Confirms that even if PolicyEngine permits "*", the FilesystemEnforcer's lexical and
+    // kernel boundary checks fail-closed and reject the crafted relative path attempt.
+    let broad_harness = SecurityTestHarness::new();
+    broad_harness.fs_enforcer.register_sandbox_root(&env.allowed_dir);
+    let broad_policy = Policy::new("policy-broad-wildcard", "Wildcard Permissive Policy", 1)
+        .with_rule(PolicyRule {
+            id: "rule-allow-all".to_string(),
+            description: "Overly broad allow all rule".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "*".to_string(),
+            priority: 100,
+        });
+    broad_harness.policy_engine.add_policy(broad_policy).unwrap();
+
+    for crafted_path in &climbing_relative_vectors {
+        let req = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: crafted_path.to_string(),
+            },
+        ).with_test_id("REGRESSION-032-BROAD");
+
+        let report = broad_harness.execute_request(req);
+        assert_ne!(
+            report.observed_result,
+            ObservedResult::AccessSuccess,
+            "Wildcard policy must still be blocked by filesystem enforcer for '{}'",
+            crafted_path
+        );
+        assert_eq!(
+            report.observed_result,
+            ObservedResult::BlockedByFirewall,
+            "Enforcement must produce BlockedByFirewall under wildcard policy for '{}'",
+            crafted_path
+        );
+        assert!(
+            !report.logs.contains(SECRET_CANARY_032),
+            "Canary must not be leaked under wildcard policy for '{}'",
+            crafted_path
+        );
+    }
 }
 
 

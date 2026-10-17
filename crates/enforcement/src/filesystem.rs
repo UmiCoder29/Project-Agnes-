@@ -540,7 +540,7 @@ impl FilesystemEnforcer {
         self.enforce_kernel_confined_read(&root_dir, target_path, raw_path, expected_resolved_target)
     }
 
-    fn find_sandbox_root(&self, expected_path: &Path, target_path: &Path, _policy_id: &str) -> Result<Option<PathBuf>, ()> {
+    pub(crate) fn find_sandbox_root(&self, expected_path: &Path, target_path: &Path, _policy_id: &str) -> Result<Option<PathBuf>, ()> {
         let roots = self.sandbox_roots.read().map_err(|_| ())?;
 
         // The sandbox root MUST enclose the policy-approved expected_path.
@@ -561,21 +561,50 @@ impl FilesystemEnforcer {
             }
         }
 
-        if best_root.is_some() {
-            return Ok(best_root);
-        }
-
-        // If expected_path was not directly enclosed, check if target_path or normalized target_path
-        // is enclosed by a registered root that also encloses expected_path.
-        // Notice: We strictly reject any fallback that infers a root from target_path.parent()
-        // which could select an unapproved root or re-read disk state.
-        for root in roots.iter() {
-            if target_path.starts_with(root) && expected_path.starts_with(root) {
-                return Ok(Some(root.clone()));
+        let selected_root = if let Some(r) = best_root {
+            r
+        } else {
+            // If expected_path was not directly enclosed, check if target_path or normalized target_path
+            // is enclosed by a registered root that also encloses expected_path.
+            // Notice: We strictly reject any fallback that infers a root from target_path.parent()
+            // which could select an unapproved root or re-read disk state.
+            let mut fallback: Option<PathBuf> = None;
+            for root in roots.iter() {
+                let lexical_target = if target_path.is_relative() {
+                    Self::normalize_path(&root.join(target_path))
+                } else {
+                    Self::normalize_path(target_path)
+                };
+                if lexical_target.starts_with(root) && expected_path.starts_with(root) {
+                    fallback = Some(root.clone());
+                    break;
+                }
             }
+            match fallback {
+                Some(r) => r,
+                None => return Ok(None),
+            }
+        };
+
+        // Lexical boundary verification: confirm target_path (whether absolute or relative)
+        // never resolves outside the selected sandbox root even before symlink resolution.
+        let lexical_target = if target_path.is_relative() {
+            Self::normalize_path(&selected_root.join(target_path))
+        } else {
+            Self::normalize_path(target_path)
+        };
+
+        if !lexical_target.starts_with(&selected_root) {
+            tracing::warn!(
+                target = %target_path.display(),
+                root = %selected_root.display(),
+                lexical = %lexical_target.display(),
+                "Target path climbs above sandbox root before symlink resolution (fail-closed)"
+            );
+            return Ok(None);
         }
 
-        Ok(None)
+        Ok(Some(selected_root))
     }
 
     pub fn normalize_path(path: &Path) -> PathBuf {
@@ -1115,6 +1144,87 @@ mod tests {
             "Error must state no suitable entries: {}",
             err_msg
         );
+    }
+
+    struct TestDir(PathBuf);
+    impl TestDir {
+        fn new() -> Self {
+            let p = std::env::temp_dir().join(format!("test_sb_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn test_find_sandbox_root_crafted_relative_path_climbing_above_root_rejected_before_symlinks() {
+        let enforcer = FilesystemEnforcer::new();
+        let temp = TestDir::new();
+        let allowed = temp.path().join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let canonical_allowed = allowed.canonicalize().unwrap();
+        enforcer.register_sandbox_root(&canonical_allowed);
+
+        let expected_file = canonical_allowed.join("file.txt");
+
+        // 1. sub/../../forbidden/secret.txt climbs above sandbox root
+        let res1 = enforcer.find_sandbox_root(&expected_file, Path::new("sub/../../forbidden/secret.txt"), "p1").unwrap();
+        assert!(res1.is_none(), "Relative path climbing above sandbox root must be rejected before symlink resolution");
+
+        // 2. ../forbidden/secret.txt climbs above sandbox root
+        let res2 = enforcer.find_sandbox_root(&expected_file, Path::new("../forbidden/secret.txt"), "p1").unwrap();
+        assert!(res2.is_none(), "Direct parent traversal relative path must be rejected before symlink resolution");
+
+        // 3. ./sub/../../forbidden/secret.txt climbs above sandbox root
+        let res3 = enforcer.find_sandbox_root(&expected_file, Path::new("./sub/../../forbidden/secret.txt"), "p1").unwrap();
+        assert!(res3.is_none(), "Relative path with dot prefix climbing above root must be rejected");
+
+        // 4. sub/nested/../../../forbidden/secret.txt climbs above sandbox root
+        let res4 = enforcer.find_sandbox_root(&expected_file, Path::new("sub/nested/../../../forbidden/secret.txt"), "p1").unwrap();
+        assert!(res4.is_none(), "Deep traversal climbing above root must be rejected");
+    }
+
+    #[test]
+    fn test_find_sandbox_root_relative_path_within_root_accepted_and_rerooted() {
+        let enforcer = FilesystemEnforcer::new();
+        let temp = TestDir::new();
+        let allowed = temp.path().join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let canonical_allowed = allowed.canonicalize().unwrap();
+        enforcer.register_sandbox_root(&canonical_allowed);
+
+        let expected_file = canonical_allowed.join("sub").join("file.txt");
+
+        // 1. sub/file.txt stays within sandbox root
+        let res1 = enforcer.find_sandbox_root(&expected_file, Path::new("sub/file.txt"), "p1").unwrap();
+        assert_eq!(res1, Some(canonical_allowed.clone()), "Relative path within sandbox root must be accepted and re-rooted");
+
+        // 2. sub/sub2/../file.txt stays within sandbox root
+        let res2 = enforcer.find_sandbox_root(&expected_file, Path::new("sub/sub2/../file.txt"), "p1").unwrap();
+        assert_eq!(res2, Some(canonical_allowed), "Relative path with inner .. staying within sandbox root must be accepted");
+    }
+
+    #[test]
+    fn test_find_sandbox_root_absolute_path_climbing_above_root_rejected_before_symlinks() {
+        let enforcer = FilesystemEnforcer::new();
+        let temp = TestDir::new();
+        let allowed = temp.path().join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let canonical_allowed = allowed.canonicalize().unwrap();
+        enforcer.register_sandbox_root(&canonical_allowed);
+
+        let expected_file = canonical_allowed.join("file.txt");
+        let climbing_abs = canonical_allowed.join("../forbidden/secret.txt");
+
+        let res = enforcer.find_sandbox_root(&expected_file, &climbing_abs, "p1").unwrap();
+        assert!(res.is_none(), "Absolute path with .. climbing above root must be rejected before symlink resolution");
     }
 }
 
