@@ -298,8 +298,10 @@ pub async fn process_action(state: &AppState, request: ActionRequest) -> Gateway
     let event = SecurityEvent::new(
         &request,
         &decision_resp.matched_policy_id,
+        decision_resp.reason.rule_id.clone(),
         decision_resp.decision,
         &decision_resp.reason.explanation,
+        decision_resp.resolved_resource.clone(),
         enforcement_res.enforcement_action,
         enforcement_res.observed_result,
         serde_json::json!({
@@ -1059,5 +1061,81 @@ mod tests {
             body_json["output"],
             "Allowed by policy; enforcement not implemented for this action type"
         );
+    }
+
+    #[tokio::test]
+    async fn test_process_action_emits_security_event_with_resolved_path_and_rule_id() {
+        let temp_dir = tempdir().unwrap();
+        let sandbox_dir = temp_dir.path().join("sandbox");
+        let link_dir = temp_dir.path().join("symlinks");
+        fs::create_dir_all(&sandbox_dir).unwrap();
+        fs::create_dir_all(&link_dir).unwrap();
+
+        let real_file = sandbox_dir.join("payload.txt");
+        fs::write(&real_file, "SECRET_CORE_DATA").unwrap();
+        let canonical_real_file = real_file.canonicalize().unwrap();
+
+        let symlink_file = link_dir.join("link_to_payload.txt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_file, &symlink_file).unwrap();
+
+        let fs_enforcer = FilesystemEnforcer::new();
+        fs_enforcer.register_sandbox_root(&sandbox_dir);
+
+        let policy_engine = PolicyEngine::new();
+        policy_engine
+            .add_policy(
+                Policy::new("p-core-test", "Core Policy", 1).with_rule(PolicyRule {
+                    id: "r-core-allow".to_string(),
+                    description: "Allow sandbox reads".to_string(),
+                    decision: Decision::Allow,
+                    agent_pattern: "*".to_string(),
+                    action_types: vec![ActionType::ReadFile],
+                    resource_pattern: format!("{}/*", sandbox_dir.canonicalize().unwrap().display()),
+                    priority: 10,
+                }),
+            )
+            .unwrap();
+
+        let memory_sink = InMemoryTelemetrySink::new();
+        let state = AppState {
+            policy_engine,
+            state_engine: StateEngine::new(),
+            fs_enforcer,
+            memory_sink,
+            log_sink: StructuredJsonLogSink,
+        };
+
+        let symlink_str = symlink_file.to_string_lossy().to_string();
+        let canonical_str = canonical_real_file.to_string_lossy().to_string();
+
+        let req = ActionRequest::new(
+            "agent-core",
+            ActionPayload::ReadFile {
+                path: symlink_str.clone(),
+            },
+        );
+
+        let resp = process_action(&state, req).await;
+        assert_eq!(resp.decision, Decision::Allow);
+
+        // Verify emitted SecurityEvent in InMemoryTelemetrySink
+        let events = state.memory_sink.events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+
+        assert_eq!(event.action_type, ActionType::ReadFile);
+        assert_eq!(event.decision, Decision::Allow);
+        assert_eq!(event.policy_id, "p-core-test");
+        assert_eq!(event.rule_id.as_deref(), Some("r-core-allow"));
+        assert_eq!(event.raw_resource, symlink_str);
+        assert_eq!(event.resolved_resource.as_deref(), Some(canonical_str.as_str()));
+
+        // Also check JSON representation matches expectations
+        let event_json = serde_json::to_value(event).unwrap();
+        assert_eq!(event_json["resolved_resource"], canonical_str);
+        assert_eq!(event_json["raw_resource"], symlink_str);
+        assert_eq!(event_json["rule_id"], "r-core-allow");
+        assert_eq!(event_json["policy_id"], "p-core-test");
     }
 }

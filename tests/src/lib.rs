@@ -53,8 +53,10 @@ impl SecurityTestHarness {
         let event = SecurityEvent::new(
             &request,
             &decision_resp.matched_policy_id,
+            decision_resp.reason.rule_id.clone(),
             decision_resp.decision,
             &decision_resp.reason.explanation,
+            decision_resp.resolved_resource.clone(),
             enforcement_res.enforcement_action,
             enforcement_res.observed_result,
             serde_json::json!({

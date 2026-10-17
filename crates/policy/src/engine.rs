@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::RwLock;
 use agnes_common::{ActionRequest, Decision, DecisionReason, PolicyDecisionResponse};
 use chrono::Utc;
-use tracing::{debug, info};
+use tracing::{info, warn};
 
 use crate::error::PolicyLoadError;
 use crate::model::{Policy, PolicyRule};
@@ -182,7 +182,13 @@ impl PolicyEngine {
         let expected_target = request.payload.target_resource();
 
         if request.action_type != expected_action_type || request.target_resource != expected_target {
-            debug!(
+            warn!(
+                action = ?request.action_type,
+                decision = ?Decision::Deny,
+                policy = "fail-closed-request-mismatch",
+                rule = "none",
+                raw_resource = %request.target_resource,
+                resolved_resource = "none",
                 header_action = ?request.action_type,
                 payload_action = ?expected_action_type,
                 header_target = %request.target_resource,
@@ -210,9 +216,13 @@ impl PolicyEngine {
         if is_path_resource(request.action_type) {
             let p = Path::new(&request.target_resource);
             if !p.is_absolute() {
-                debug!(
-                    target = %request.target_resource,
+                warn!(
                     action = ?request.action_type,
+                    decision = ?Decision::Deny,
+                    policy = "fail-closed-relative-path",
+                    rule = "none",
+                    raw_resource = %request.target_resource,
+                    resolved_resource = "none",
                     "Relative path rejected at policy boundary: fail-closed DENY"
                 );
                 return PolicyDecisionResponse {
@@ -240,9 +250,13 @@ impl PolicyEngine {
             }
             Ok(None) => (request.target_resource.clone(), None),
             Err(err) => {
-                debug!(
-                    target = %request.target_resource,
+                warn!(
                     action = ?request.action_type,
+                    decision = ?Decision::Deny,
+                    policy = "fail-closed-path-resolution",
+                    rule = "none",
+                    raw_resource = %request.target_resource,
+                    resolved_resource = "none",
                     error = %err,
                     "Path resolution failed for action target: fail-closed DENY"
                 );
@@ -292,11 +306,14 @@ impl PolicyEngine {
         }
 
         if matching_rules.is_empty() {
-            debug!(
+            info!(
                 agent = %request.agent_id,
                 action = ?request.action_type,
-                resource = %request.target_resource,
-                resolved = %resolved_target,
+                decision = ?Decision::Deny,
+                policy = "default-fail-closed",
+                rule = "none",
+                raw_resource = %request.target_resource,
+                resolved_resource = ?resolved_resource_opt,
                 "No matching rule found: default FAIL-CLOSED deny"
             );
 
@@ -352,9 +369,14 @@ impl PolicyEngine {
         let (chosen_policy, chosen_rule) = match matching_rules.first().copied() {
             Some(pair) => pair,
             None => {
-                debug!(
-                    target = %resolved_target,
+                info!(
+                    agent = %request.agent_id,
                     action = ?request.action_type,
+                    decision = ?Decision::Deny,
+                    policy = "default-fail-closed",
+                    rule = "none",
+                    raw_resource = %request.target_resource,
+                    resolved_resource = ?resolved_resource_opt,
                     "No matching policy rule found; default deny"
                 );
                 return PolicyDecisionResponse {
@@ -371,12 +393,14 @@ impl PolicyEngine {
             }
         };
 
-        debug!(
+        info!(
             agent = %request.agent_id,
+            action = ?request.action_type,
             decision = ?chosen_rule.decision,
             policy = %chosen_policy.id,
             rule = %chosen_rule.id,
-            resolved = %resolved_target,
+            raw_resource = %request.target_resource,
+            resolved_resource = ?resolved_resource_opt,
             "Policy decision reached"
         );
 
