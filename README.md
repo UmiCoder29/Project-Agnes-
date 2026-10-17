@@ -12,6 +12,7 @@ Agnes sits between an agent and the host machine. Every action the agent request
 * [What does not work yet](#what-does-not-work-yet)
 * [How a request is handled](#how-a-request-is-handled)
 * [Rule precedence](#rule-precedence)
+* [Path comparison rules](#path-comparison-rules)
 * [Guarantees and their limits](#guarantees-and-their-limits)
 * [Tests and proof](#tests-and-proof)
 * [Concepts used](#concepts-used)
@@ -29,12 +30,13 @@ Agnes sits between an agent and the host machine. Every action the agent request
 | Deterministic policy engine with priority, specificity, and Deny wins ties | Working |
 | Default deny: no matching rule, an evaluation error, a panic, or a poisoned lock all produce Deny | Working |
 | Rules with an empty agent, action list, or resource pattern match nothing | Working |
-| Real path resolution before any rule runs: symlinks followed, `..` removed, bad input rejected | Working |
+| Real path resolution before any rule runs: symlinks followed, `.` and `..` collapsed, repeated and trailing slashes handled, bad input rejected | Working |
 | Rule patterns resolved once, when the policy is loaded, not on every request | Working |
 | Atomic policy loading: one bad rule rejects the entire policy | Working |
 | Kernel confined file reads on Linux using `openat2` with `RESOLVE_BENEATH` | Working |
 | Check after opening that the file opened is exactly the file the policy approved | Working |
 | Sandbox roots set through `AGNES_SANDBOX_ROOTS`, with no roots registered on any invalid value | Working |
+| Startup check that refuses a sandbox root on a filesystem that folds case or Unicode normalization | Working, with documented limits |
 | Structured audit events with a correlation id, decision, matched rule, and observed result | Working, in memory and in logs |
 | HTTP gateway (`agnes-core`) for policies, actions, events, and session state | Working, unauthenticated |
 
@@ -51,7 +53,9 @@ Only `ReadFile` is enforced end to end. This list is deliberate, so nobody has t
 * **Patterns follow the filesystem as it was at load time.** A rule pattern is resolved when the policy is loaded. If a symlink in the pattern is later repointed, the rule stays bound to the original location. A pattern for a directory that does not exist yet is stored as written.
 * **Trailing star patterns match by string prefix.** A pattern such as `/data*` also matches `/database/file`. Use `/data/*` for directory scope.
 * **In place changes to an approved file are not detected.** The check after opening confirms which file was opened, not that its contents are unchanged.
-* **No hot reload rules, rate limiting, case folding rules, or reasoning layer** yet.
+* **The folding check covers the root directory only.** Directories with per directory case folding (ext4 casefold) and filesystems mounted below a root are not probed. The whole tree under a root must sit on a filesystem that does not fold case or normalization.
+* **Read only roots are probed partially.** With a read only root, Agnes can only test the characters that already appear in existing filenames. A root with no suitable entry is rejected.
+* **No hot reload rules, rate limiting, or reasoning layer** yet.
 
 ## How a request is handled
 
@@ -87,6 +91,16 @@ When several rules match a request, the engine sorts them and takes the first on
 
 One consequence to know about: at equal priority an exact path rule beats a wildcard rule whatever its decision. An exact Allow on `/data/report.txt` beats a Deny on `/data/*` if both have priority 10. Give the Deny a higher priority if that is not what you want.
 
+## Path comparison rules
+
+Paths are compared byte for byte after they are resolved to a real path on disk.
+
+* Repeated slashes, `.` segments, trailing slashes, and `..` segments are collapsed before comparison, so `/data//a/./b` and `/data/a/b` are the same path. A `..` that follows a symlink is resolved against the real parent of the link target, not the link's own folder.
+* Upper and lower case spellings are different paths. `/data/SECRET` is not `/data/secret`.
+* Different Unicode forms of the same text are different paths. A name written with one combined character is not the same as the same name written with a base letter and a combining mark.
+
+This is only safe on a filesystem that behaves the same way. On a filesystem that folds case or normalization (macOS, Windows, ext4 casefold directories, vfat, NTFS, some SMB and NFS shares), `/data/SECRET` and `/data/secret` could be the same file, and a Deny rule written for one spelling would miss the other. For that reason the gateway probes each sandbox root at startup and refuses to register a root that folds.
+
 ## Guarantees and their limits
 
 | Threat | What Agnes does | Known limit |
@@ -95,6 +109,8 @@ One consequence to know about: at equal priority an exact path rule beats a wild
 | Symlink escape, chained links, loops | Policy sees the fully resolved path. Loops fail closed. The kernel also confines the open | None known |
 | Link swapped after the policy check | The opened file is compared with the approved path. A swapped link, a swapped approved file, and a swapped directory are all blocked | Content changes inside the approved file are out of scope |
 | Spaces, null bytes, control characters in a path | Rejected before evaluation, never trimmed | None known |
+| Slash and dot variants of a denied path | Collapsed to the same real path before matching, so a Deny cannot be dodged | None known |
+| Case and Unicode variants of a denied path | Treated as different paths, and the sandbox root must sit on a filesystem that agrees | The probe covers the root only, and read only roots are probed partially |
 | Policy and enforcement disagreeing about a path | Each path is resolved once and the same string is used by every later step | None known |
 | A rule silently dropped because its pattern is bad | The whole policy is rejected, nothing is loaded, earlier policies stay in force, and the API returns 400 | None known |
 | Rules with empty patterns | Match nothing | None known |
@@ -103,18 +119,18 @@ One consequence to know about: at equal priority an exact path rule beats a wild
 
 ## Tests and proof
 
-As of commit `c086fde`, run as an unprivileged user:
+As of commit `98d2f05`, run as an unprivileged user:
 
 ```
-agnes-policy unit tests ............................ 15 passed
-agnes-enforcement unit tests ........................  1 passed
-agnes-core gateway tests ............................  3 passed
+agnes-policy unit tests ............................ 17 passed
+agnes-enforcement unit tests ........................  8 passed
+agnes-core gateway tests ............................  5 passed
 adversarial_bypass_002 ..............................  4 passed
 adversarial_filesystem_fuzzing ......................  1 passed
-regression_filesystem_boundary ...................... 36 passed
+regression_filesystem_boundary ...................... 44 passed
 test_001_and_002 ....................................  2 passed
 --------------------------------------------------------------
-TOTAL                                                62 passed, 0 failed
+TOTAL                                                81 passed, 0 failed
 ```
 
 Reproduce it:
@@ -140,7 +156,10 @@ cargo test --workspace 2>&1 | grep -E "Running|test result"
 | REGRESSION 026 | Precedence: deny inside allow, allow inside deny, equal conflicts, tie breaks |
 | REGRESSION 027 | Rule patterns that go through symlinks are bound to the real location at load time |
 | REGRESSION 028 and 029 (six tests) | Any rule with a bad pattern rejects the whole policy: leading space, trailing space, symlink loop, null byte, a bad last rule, and an earlier valid policy staying in force |
-| Gateway tests | A read inside a sandbox root works, a read outside is blocked, every invalid `AGNES_SANDBOX_ROOTS` value registers nothing, and `POST /v1/policies` returns 400 for a bad policy and registers nothing |
+| REGRESSION 030 (five tests) | Repeated slashes, trailing slashes, and dot segments in requests and in rule patterns match the same rule as the clean form, and a Deny cannot be dodged with them |
+| REGRESSION 031 (three tests) | Case and Unicode variants of a denied path return no content, a symlink followed by `..` is judged against the real parent, and the folding probe accepts a normal root and leaves no file behind |
+| Enforcement unit tests (seven simulated filesystem tests) | The folding probe rejects simulated case folding and Unicode folding on writable and read only roots, accepts a normal filesystem, rejects an empty read only root, and removes its probe file on every path |
+| Gateway tests | A read inside a sandbox root works, a read outside is blocked, every invalid `AGNES_SANDBOX_ROOTS` value registers nothing, a folding root registers nothing, and `POST /v1/policies` returns 400 for a bad policy and registers nothing |
 | `adversarial_filesystem_fuzzing` | Malformed, oversized, and unusual paths |
 
 ### How the tests were checked
@@ -165,12 +184,20 @@ A test that cannot fail proves nothing. For each fix, the fix was broken on purp
 | Pattern resolved at load time | Resolution turned into a no op | Test 027 |
 | Deny wins ties | Tie break reversed | Test 026 |
 | Atomic policy load | Errors ignored, then bad rules dropped like the old behavior | Nine tests in each case |
+| Lexical normalizer for missing paths | `..` kept as text instead of collapsed | The dot and parent segment test in `path.rs` |
+| Folding probe, overall | Detector made to always report no folding | Six of the eight enforcement tests |
+| Folding probe, writable case check | Comparison disabled | The writable case folding test |
+| Folding probe, writable Unicode check | Comparison disabled | The writable Unicode folding test |
+| Folding probe, cleanup | Guard made to never remove the probe file | Both writable rejection tests |
+| Folding probe, read only case check | Comparison disabled | The read only case folding test |
+| Folding probe, read only Unicode check | Comparison disabled | The read only Unicode folding test |
 
 Other checks that mattered:
 
 * **A weak test was rejected.** The first version of the single resolution test passed on both old and new code, so it was rewritten to repoint a symlink during evaluation.
 * **A bypass was found in review.** An early version of the post open check re resolved the approved path from disk. An attacker could replace the approved file with a link to a denied file and both sides resolved to the same place. The fallback was removed (REGRESSION 019).
 * **A silent policy weakening was found in review.** A rule with an unresolvable pattern used to be dropped while the rest of the policy loaded. A Deny rule with a leading space in its pattern disappeared and a broad Allow let a secret file be read. The whole policy is now rejected (REGRESSION 028 and 029).
+* **A test gap was found in review.** The first version of the folding probe was only tested for false alarms, and replacing the detector with "no folding" failed nothing. The probe now runs against simulated folding filesystems, and every comparison and the cleanup path is pinned by a test.
 * **Test code stays out of production builds.** Counters and hooks used by tests sit behind the `test-hooks` Cargo feature. Calling them without the feature fails to compile.
 * **No panics outside tests.** A search of `apps/` and every crate finds no `unwrap`, `expect`, or `panic!` in non test code.
 
@@ -183,10 +210,12 @@ The engineering rules every change must follow are in [`skills.md`](skills.md). 
 * **TOCTOU (time of check to time of use).** The gap between checking a file and opening it is the attack window. Agnes closes it by opening inside a kernel enforced boundary and then verifying what was actually opened.
 * **`openat2` with `RESOLVE_BENEATH`.** A Linux system call that makes the kernel refuse any path that escapes a directory, including through symlinks.
 * **`/proc/self/fd` verification.** After opening, the real path of the open file descriptor is read back and compared with the path the policy approved.
+* **Case and Unicode normalization folding.** Some filesystems treat different spellings of a name as one file. Agnes compares paths byte for byte and probes the sandbox root at startup so the two never disagree.
 * **Deterministic rule ordering.** Priority, then specificity, then Deny before Allow, then ids. The same input always gives the same decision.
 * **Atomic loading.** A policy is validated completely before any state changes, so a failure leaves nothing half applied.
 * **Load time resolution.** Rule patterns are resolved once when the policy is loaded, which removes repeated resolution on every request.
 * **Panic containment.** `catch_unwind` around evaluation, and recovery handling for poisoned locks, so internal failures become Deny.
+* **Dependency injection for testing.** The folding probe talks to the filesystem through a small trait, so tests can substitute simulated filesystems that fold case or normalization.
 * **Regression testing with mutation checks.** Every fix has a test, and the test is proven by breaking the fix.
 * **Fuzzing.** Generated malformed and oversized paths are fed through the full path.
 * **Feature gated test hooks.** Test only instrumentation uses thread local state behind a Cargo feature.
@@ -197,7 +226,7 @@ The engineering rules every change must follow are in [`skills.md`](skills.md). 
 
 | Milestone | Focus | Status |
 |---|---|---|
-| 1 | Core policy correctness: path resolution, races, default deny, rule precedence, fuzzing | In progress, prompts 1 to 5 of 14 done |
+| 1 | Core policy correctness: path resolution, races, default deny, rule precedence, path normalization, fuzzing | In progress, prompts 1 to 6 of 14 done |
 | 2 | Enforcement for writes, processes, network, tools, and MCP | Planned |
 | 3 | Identity and authentication | Planned |
 | 4 | Mandatory interception | Planned |
@@ -213,7 +242,7 @@ apps/
 crates/
   common/         Typed actions, decisions, and events
   policy/         Policy engine, path resolution, rule model, load errors
-  enforcement/    Filesystem enforcement with Linux openat2 confinement
+  enforcement/    Filesystem enforcement, openat2 confinement, folding probe
   state/          Session coordinator and audit event history
   telemetry/      JSON logger and in memory event sinks
 infra/            Docker files, Postgres schema (not connected), mock targets
@@ -250,6 +279,8 @@ The `agnes-core` service needs `AGNES_SANDBOX_ROOTS` set, for example `AGNES_SAN
 | `AGNES_SANDBOX_ROOTS` | Colon separated list of absolute directories the gateway may read from | Unset, so no roots and every file read is denied |
 
 Validation is all or nothing. If any entry is empty (a leading, trailing, or doubled colon), relative (`.`, `..`, `dir/sub`), missing, not a directory, or `/`, the gateway logs an error and registers no roots at all. It never falls back to `/` or the current directory.
+
+Each root is then probed for case and Unicode normalization folding. A writable root is probed with a temporary file that is always deleted. A read only root is probed using existing entries. If any root folds, or cannot be probed, no roots are registered. Put each sandbox on a filesystem that is case sensitive and does not fold normalization, such as a default ext4, xfs, or btrfs volume.
 
 ## HTTP API
 
@@ -312,7 +343,7 @@ Submit an action:
 ```json
 {
   "correlation_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
-  "timestamp": "2026-10-16T12:00:00Z",
+  "timestamp": "2026-10-17T12:00:00Z",
   "agent_id": "agent-001",
   "action_type": "READ_FILE",
   "target_resource": "/sandbox/data.txt",
