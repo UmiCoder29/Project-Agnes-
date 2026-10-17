@@ -14,7 +14,7 @@ use agnes_common::{
 use agnes_enforcement::{
     DefaultFilesystemFoldingProbe, EnforcementResult, FilesystemEnforcer, FilesystemFoldingProbe,
 };
-use agnes_policy::{Policy, PolicyEngine};
+use agnes_policy::{Policy, PolicyEngine, PolicyLoadError};
 use agnes_state::StateEngine;
 use agnes_telemetry::{InMemoryTelemetrySink, StructuredJsonLogSink, TelemetrySink};
 use serde::{Deserialize, Serialize};
@@ -206,8 +206,12 @@ async fn add_policy_handler(
         ),
         Err(err) => {
             warn!(error = %err, "Failed to register policy: rejecting whole policy");
+            let status = match err {
+                PolicyLoadError::DuplicatePolicyId { .. } => StatusCode::CONFLICT,
+                _ => StatusCode::BAD_REQUEST,
+            };
             (
-                StatusCode::BAD_REQUEST,
+                status,
                 Json(serde_json::json!({
                     "error": "Failed to register policy",
                     "details": err.to_string(),
@@ -764,5 +768,47 @@ mod tests {
         assert_eq!(body_json["matched_policy_id"], "fail-closed-relative-path");
         assert_eq!(body_json["enforcement_action"], "BLOCK_REQUEST");
         assert_eq!(body_json["observed_result"], "BLOCKED_BY_FIREWALL");
+    }
+
+    #[tokio::test]
+    async fn test_post_policy_duplicate_id_returns_409_conflict() {
+        let state = Arc::new(AppState {
+            policy_engine: PolicyEngine::new(),
+            state_engine: StateEngine::new(),
+            fs_enforcer: FilesystemEnforcer::new(),
+            memory_sink: InMemoryTelemetrySink::new(),
+            log_sink: StructuredJsonLogSink,
+        });
+
+        let policy = Policy::new("p-unique-1", "Unique Policy 1", 1).with_rule(PolicyRule {
+            id: "rule-1".to_string(),
+            description: "Rule 1".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "*".to_string(),
+            priority: 10,
+        });
+
+        // 1. First registration succeeds with 201 Created
+        let resp1 = add_policy_handler(State(state.clone()), Json(policy.clone()))
+            .await
+            .into_response();
+        assert_eq!(resp1.status(), StatusCode::CREATED);
+
+        // 2. Second registration with duplicate policy ID returns 409 Conflict
+        let resp2 = add_policy_handler(State(state), Json(policy))
+            .await
+            .into_response();
+        assert_eq!(
+            resp2.status(),
+            StatusCode::CONFLICT,
+            "Registering duplicate policy ID must return HTTP 409 Conflict"
+        );
+
+        let body_bytes = axum::body::to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body_json["policy_id"], "p-unique-1");
+        assert_eq!(body_json["reason"], "Duplicate policy ID");
     }
 }

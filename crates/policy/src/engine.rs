@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::RwLock;
 use agnes_common::{ActionRequest, Decision, DecisionReason, PolicyDecisionResponse};
@@ -8,6 +9,23 @@ use crate::error::PolicyLoadError;
 use crate::model::{Policy, PolicyRule};
 use crate::path::{is_path_resource, resolve_request_target};
 
+/// Deterministic policy evaluation engine for Project Agnes.
+///
+/// # Concurrency & Atomic Swap Guarantees
+/// - In-flight action requests are always evaluated against exactly one complete policy set.
+/// - Policy updates via `replace_policies` atomically swap the entire policy set under a single
+///   write lock acquisition, preventing any in-flight request from ever observing a half-updated,
+///   partially loaded, or mixed policy set.
+/// - Pre-validation ensures all policies and rule patterns in a candidate replacement set are fully
+///   validated and resolved prior to acquiring the write lock; any error rejects the entire set
+///   and leaves the previous policy set completely untouched and in effect.
+///
+/// # Operational Limits & Security Scope
+/// - No per-policy selective removal: Individual policies cannot be deleted individually;
+///   modifications require replacing the whole policy set via `replace_policies` or clearing all
+///   policies via `clear`.
+/// - Authentication and authorization for policy modification endpoints are intentionally
+///   deferred to Milestone 3 (identity/auth milestone) and are not enforced at this layer.
 #[derive(Default)]
 pub struct PolicyEngine {
     policies: RwLock<Vec<Policy>>,
@@ -27,6 +45,9 @@ impl PolicyEngine {
     /// If ANY rule fails validation (e.g. symlink loop, invalid path, null byte, leading/trailing whitespace),
     /// the ENTIRE policy is rejected with `PolicyLoadError::InvalidRulePattern`, no rules from it are loaded,
     /// and all previously loaded policies remain completely untouched.
+    ///
+    /// Duplicate Rejection:
+    /// Rejects policies whose `id` is already loaded with `PolicyLoadError::DuplicatePolicyId`.
     pub fn add_policy(&self, mut policy: Policy) -> Result<(), PolicyLoadError> {
         // 1. Validate and resolve all rule patterns atomically BEFORE modifying state
         policy.validate_and_resolve_patterns()?;
@@ -37,6 +58,12 @@ impl PolicyEngine {
             Err(poisoned) => poisoned.into_inner(),
         };
 
+        if guard.iter().any(|p| p.id == policy.id) {
+            return Err(PolicyLoadError::DuplicatePolicyId {
+                policy_id: policy.id,
+            });
+        }
+
         info!(
             policy_id = %policy.id,
             policy_name = %policy.name,
@@ -44,6 +71,48 @@ impl PolicyEngine {
             "Loaded policy into engine"
         );
         guard.push(policy);
+        Ok(())
+    }
+
+    /// Replaces the entire active policy set atomically.
+    ///
+    /// Atomic Swap Guarantee:
+    /// Validates every policy and resolves all rule patterns for the entire set BEFORE
+    /// touching the active engine state. Checks for duplicate policy IDs within the new set.
+    /// If ANY rule or policy fails validation, the entire replacement is rejected, returning
+    /// an error without modifying active state (the existing policy set remains 100% in effect).
+    /// Once all validation succeeds, the active policy set is swapped under a single write lock
+    /// acquisition, ensuring concurrent evaluators observe either the complete old set or the
+    /// complete new set, with no intermediate, partial, or empty states.
+    pub fn replace_policies(&self, mut new_policies: Vec<Policy>) -> Result<(), PolicyLoadError> {
+        // 1. Check for duplicate policy IDs within the candidate set BEFORE touching state
+        let mut seen_ids = HashSet::new();
+        for policy in &new_policies {
+            if !seen_ids.insert(&policy.id) {
+                return Err(PolicyLoadError::DuplicatePolicyId {
+                    policy_id: policy.id.clone(),
+                });
+            }
+        }
+
+        // 2. Validate and resolve every rule pattern across every policy BEFORE touching state
+        for policy in &mut new_policies {
+            policy.validate_and_resolve_patterns()?;
+        }
+
+        // 3. Atomically swap the entire policy set under ONE write lock acquisition
+        let mut guard = match self.policies.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        info!(
+            policy_count = new_policies.len(),
+            "Atomically replacing active policy set"
+        );
+        *guard = new_policies;
+        self.policies.clear_poison();
+
         Ok(())
     }
 
@@ -776,6 +845,128 @@ mod tests {
             );
             assert_eq!(decision.reason.rule_id.as_deref(), Some("r-exact-deny"));
         }
+    }
+
+    #[test]
+    fn test_add_policy_rejects_duplicate_id() {
+        let engine = PolicyEngine::new();
+        let policy1 = Policy::new("p1", "Policy 1", 1).with_rule(PolicyRule {
+            id: "r1".to_string(),
+            description: "Rule 1".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "*".to_string(),
+            priority: 10,
+        });
+        assert!(engine.add_policy(policy1).is_ok());
+
+        let policy1_dup = Policy::new("p1", "Policy 1 Duplicate", 1).with_rule(PolicyRule {
+            id: "r2".to_string(),
+            description: "Rule 2".to_string(),
+            decision: Decision::Deny,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "*".to_string(),
+            priority: 10,
+        });
+
+        match engine.add_policy(policy1_dup) {
+            Err(PolicyLoadError::DuplicatePolicyId { policy_id }) => {
+                assert_eq!(policy_id, "p1");
+            }
+            res => panic!("Expected DuplicatePolicyId error, got {:?}", res),
+        }
+    }
+
+    #[test]
+    fn test_replace_policies_rejects_duplicate_ids_within_new_set() {
+        let engine = PolicyEngine::new();
+        let policy_a1 = Policy::new("p-dup", "Policy Dup 1", 1).with_rule(PolicyRule {
+            id: "r1".to_string(),
+            description: "Rule 1".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "*".to_string(),
+            priority: 10,
+        });
+        let policy_a2 = Policy::new("p-dup", "Policy Dup 2", 2).with_rule(PolicyRule {
+            id: "r2".to_string(),
+            description: "Rule 2".to_string(),
+            decision: Decision::Deny,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "*".to_string(),
+            priority: 20,
+        });
+
+        let res = engine.replace_policies(vec![policy_a1, policy_a2]);
+        match res {
+            Err(PolicyLoadError::DuplicatePolicyId { policy_id }) => {
+                assert_eq!(policy_id, "p-dup");
+            }
+            other => panic!("Expected DuplicatePolicyId error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_replace_policies_atomic_rejection_on_invalid_rule_preserves_old_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let test_file = temp.path().join("file.txt");
+        std::fs::write(&test_file, "DATA").unwrap();
+        let canonical_file = test_file.canonicalize().unwrap();
+        let file_str = canonical_file.to_str().unwrap().to_string();
+
+        let engine = PolicyEngine::new();
+        let valid_initial = Policy::new("p-init", "Initial Valid Policy", 1).with_rule(PolicyRule {
+            id: "r-init".to_string(),
+            description: "Initial rule".to_string(),
+            decision: Decision::Deny,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: file_str.clone(),
+            priority: 10,
+        });
+        engine.add_policy(valid_initial).unwrap();
+
+        // Candidate set has one valid policy and one invalid policy (invalid rule pattern with null byte)
+        let candidate_valid = Policy::new("p-cand-valid", "Candidate Valid", 1).with_rule(PolicyRule {
+            id: "r-cand-1".to_string(),
+            description: "Rule 1".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "*".to_string(),
+            priority: 10,
+        });
+        let candidate_invalid = Policy::new("p-cand-invalid", "Candidate Invalid", 2).with_rule(PolicyRule {
+            id: "r-cand-invalid".to_string(),
+            description: "Invalid rule with null byte".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "/invalid/\0path".to_string(),
+            priority: 20,
+        });
+
+        let res = engine.replace_policies(vec![candidate_valid, candidate_invalid]);
+        assert!(res.is_err(), "Must reject entire candidate set on invalid rule");
+
+        // Old policy must remain 100% in effect
+        let req = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: file_str,
+            },
+        );
+        let decision = engine.evaluate(&req);
+        assert_eq!(
+            decision.decision,
+            Decision::Deny,
+            "Old policy set must remain active and deny"
+        );
+        assert_eq!(decision.matched_policy_id, "p-init");
     }
 }
 

@@ -10,6 +10,10 @@ pub enum PolicyLoadError {
     },
     #[error("Failed to parse policy JSON: {0}")]
     JsonParseError(#[from] serde_json::Error),
+    #[error("Policy with ID '{policy_id}' is already loaded")]
+    DuplicatePolicyId {
+        policy_id: String,
+    },
     #[error("Policy storage lock poisoned")]
     LockPoisoned,
 }
@@ -18,6 +22,7 @@ impl PolicyLoadError {
     pub fn policy_id(&self) -> Option<&str> {
         match self {
             Self::InvalidRulePattern { policy_id, .. } => Some(policy_id),
+            Self::DuplicatePolicyId { policy_id } => Some(policy_id),
             _ => None,
         }
     }
@@ -32,6 +37,7 @@ impl PolicyLoadError {
     pub fn reason(&self) -> Option<&str> {
         match self {
             Self::InvalidRulePattern { reason, .. } => Some(reason),
+            Self::DuplicatePolicyId { .. } => Some("Duplicate policy ID"),
             _ => None,
         }
     }
