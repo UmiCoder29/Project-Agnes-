@@ -21,6 +21,49 @@ pub enum ActionType {
     CommunicateWithAgent,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PatternKind {
+    FilesystemPath,
+    LiteralString,
+}
+
+impl ActionType {
+    pub const ALL: [ActionType; 14] = [
+        ActionType::ReadFile,
+        ActionType::WriteFile,
+        ActionType::ExecuteProcess,
+        ActionType::CreateProcess,
+        ActionType::NetworkConnect,
+        ActionType::DnsLookup,
+        ActionType::HttpRequest,
+        ActionType::CallTool,
+        ActionType::CallMcpTool,
+        ActionType::ReadSecret,
+        ActionType::SendData,
+        ActionType::ModifyPolicy,
+        ActionType::RequestCredential,
+        ActionType::CommunicateWithAgent,
+    ];
+
+    pub fn pattern_kind(&self) -> PatternKind {
+        match self {
+            ActionType::ReadFile | ActionType::WriteFile => PatternKind::FilesystemPath,
+            ActionType::ExecuteProcess
+            | ActionType::CreateProcess
+            | ActionType::NetworkConnect
+            | ActionType::DnsLookup
+            | ActionType::HttpRequest
+            | ActionType::CallTool
+            | ActionType::CallMcpTool
+            | ActionType::ReadSecret
+            | ActionType::SendData
+            | ActionType::ModifyPolicy
+            | ActionType::RequestCredential
+            | ActionType::CommunicateWithAgent => PatternKind::LiteralString,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "details")]
 pub enum ActionPayload {
@@ -95,21 +138,9 @@ pub enum ActionPayload {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActionRequest {
-    pub correlation_id: Uuid,
-    pub test_id: Option<String>,
-    pub timestamp: DateTime<Utc>,
-    pub agent_id: String,
-    pub session_id: Option<String>,
-    pub action_type: ActionType,
-    pub payload: ActionPayload,
-    pub target_resource: String,
-}
-
-impl ActionRequest {
-    pub fn new(agent_id: impl Into<String>, payload: ActionPayload) -> Self {
-        let action_type = match &payload {
+impl ActionPayload {
+    pub fn action_type(&self) -> ActionType {
+        match self {
             ActionPayload::ReadFile { .. } => ActionType::ReadFile,
             ActionPayload::WriteFile { .. } => ActionType::WriteFile,
             ActionPayload::ExecuteProcess { .. } => ActionType::ExecuteProcess,
@@ -124,9 +155,11 @@ impl ActionRequest {
             ActionPayload::ModifyPolicy { .. } => ActionType::ModifyPolicy,
             ActionPayload::RequestCredential { .. } => ActionType::RequestCredential,
             ActionPayload::CommunicateWithAgent { .. } => ActionType::CommunicateWithAgent,
-        };
+        }
+    }
 
-        let target_resource = match &payload {
+    pub fn target_resource(&self) -> String {
+        match self {
             ActionPayload::ReadFile { path } => path.clone(),
             ActionPayload::WriteFile { path, .. } => path.clone(),
             ActionPayload::ExecuteProcess { command, .. } => command.clone(),
@@ -141,7 +174,26 @@ impl ActionRequest {
             ActionPayload::ModifyPolicy { policy_id, .. } => policy_id.clone(),
             ActionPayload::RequestCredential { scope } => scope.clone(),
             ActionPayload::CommunicateWithAgent { target_agent, .. } => target_agent.clone(),
-        };
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionRequest {
+    pub correlation_id: Uuid,
+    pub test_id: Option<String>,
+    pub timestamp: DateTime<Utc>,
+    pub agent_id: String,
+    pub session_id: Option<String>,
+    pub action_type: ActionType,
+    pub payload: ActionPayload,
+    pub target_resource: String,
+}
+
+impl ActionRequest {
+    pub fn new(agent_id: impl Into<String>, payload: ActionPayload) -> Self {
+        let action_type = payload.action_type();
+        let target_resource = payload.target_resource();
 
         Self {
             correlation_id: Uuid::new_v4(),

@@ -1,51 +1,36 @@
-SKILL.md — Project Agnes Fix Verification Discipline
+skills.md: Project Agnes change discipline
 
-This applies to every prompt executed against the Project Agnes codebase
-(Rust workspace: agnes-common, agnes-policy, agnes-enforcement, agnes-state,
-agnes-telemetry, agnes-core, agnes-tests). Follow this in addition to the
-Master Context rules for whichever milestone prompt you are given.
+Applies to every change in the Project Agnes workspace (agnes-common, agnes-policy, agnes-enforcement, agnes-state, agnes-telemetry, agnes-core, agnes-tests). Follow it together with the Master Context.
 
-1. Restate the bug precisely.
-   Before writing code, state in one sentence exactly which function and
-   crate is wrong, and why. If you cannot do this precisely, you do not
-   understand the bug well enough to fix it.
+1. State the problem precisely.
+   Before writing code, say in one sentence which function in which crate is wrong, or which gap exists, and why. If you cannot, you do not understand it yet.
 
-2. Hunt for siblings before declaring done.
-   Project Agnes has repeated the same mistake more than once: a fix lands
-   in one function (e.g. resolve_real_path in policy/src/path.rs) while a
-   sibling call site (e.g. the enforcer in enforcement/src/filesystem.rs,
-   or matches_resource's own canonicalization fallback in policy/src/model.rs)
-   still has the old, inconsistent behavior. Before finishing any prompt,
-   grep the whole workspace for every other place that touches the same
-   logic, data, or assumption you just changed. List every other call site
-   you checked and what you found there, even if you changed nothing.
+2. Hunt for siblings.
+   Fixes have repeatedly landed in one place while another call site kept the old behavior. Grep the whole workspace for every other place that touches the same logic, data, or assumption. List each place you checked and what you found, even if you changed nothing. Check the effect on EVERY action type and every caller, not just the one in the test.
 
 3. A regression test must fail on the old code.
-   Every new regression test must be checked against the pre-fix version
-   of the code and shown to fail there. A test that would pass against
-   both the old and new code (like the first version of the atomic
-   resolution test) is not a regression test, it's decoration, and it will
-   be rejected in review. State explicitly, in your summary, why the test
-   would have failed before your fix.
+   Run each new test against the pre fix code and show it failing. A test that passes on both old and new code is a guard, and you must say so plainly instead of calling it a fix test. Then run a mutation check: break the fix again and show which tests fail. If none fail, the tests are not pinning the fix.
 
-4. No test-only scaffolding in production code.
-   Counters, hooks, or instrumentation added only to prove a fix (like the
-   global resolution counter and hook) must be gated behind a feature flag
-   such as test-hooks or #[cfg(test)], never shipped in a normal build.
-   Say explicitly in your summary that you gated it and how.
+4. Tests must be reliable.
+   Tests that touch shared process state (working directory, environment variables, global locks) must serialize and must recover from a poisoned lock. Avoid probabilistic assertions. Run the whole workspace as a non root user and paste the per suite result lines.
 
-5. Fail closed, always.
-   Any new edge case, error path, or ambiguous input introduced by your
-   change must deny or reject by default, never silently allow or fall
-   back to old behavior.
+5. No test only code in production builds.
+   Counters, hooks, and instrumentation must sit behind a feature flag such as test-hooks or #[cfg(test)]. Say how you gated them.
 
-6. Think like the adversary who reads this diff.
-   Before finishing, name at least one way an adversary would specifically
-   target the exact thing you just changed. If your fix doesn't already
-   handle it, say so plainly instead of staying silent about it.
+6. Fail closed, always.
+   Any new edge case, error path, or ambiguous input denies or rejects. A rule, policy, or config that cannot be fully validated is rejected as a whole. Never drop, skip, or partially apply it.
 
-7. End with a real summary, not a changelog.
-   Every response must end with: what you changed, every other location in
-   the workspace you checked and did not need to change, what you
-   deliberately did not fix and why, and any new risk this change
-   introduces that the next prompt should know about.
+7. No decision may depend on process state.
+   Working directory, environment, locale, and clock must not change a policy decision.
+
+8. Think like the adversary who reads this diff.
+   Name at least one way to attack the exact thing you changed. If your change does not handle it, say so.
+
+9. Stay in scope, and report what is outside it.
+   Do not build later milestone features. If you find a problem outside this change, report it in the summary instead of silently fixing it.
+
+10. Be honest about verification.
+   State what you could not run or confirm. Do not claim a result you did not observe.
+
+11. End with a real summary.
+   What changed. Every other location checked and left alone. What you deliberately did not fix and why. What you could not verify. Any new risk the next change should know about. Test counts before and after. A suggested commit message that describes the change and does not use prompt numbers.

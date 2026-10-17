@@ -264,7 +264,7 @@ fn test_regression_nested_chained_symlinks_pointing_to_denied_path_evaluated_aga
             description: "Explicitly deny all access to denied_zone".to_string(),
             decision: Decision::Deny,
             agent_pattern: "agent-001".to_string(),
-            action_types: vec![ActionType::ReadFile, ActionType::WriteFile, ActionType::ReadSecret],
+            action_types: vec![ActionType::ReadFile, ActionType::WriteFile],
             resource_pattern: format!("{}/*", denied_dir.display()),
             priority: 100,
         })
@@ -273,7 +273,7 @@ fn test_regression_nested_chained_symlinks_pointing_to_denied_path_evaluated_aga
             description: "Allow access inside allowed_zone".to_string(),
             decision: Decision::Allow,
             agent_pattern: "agent-001".to_string(),
-            action_types: vec![ActionType::ReadFile, ActionType::WriteFile, ActionType::ReadSecret],
+            action_types: vec![ActionType::ReadFile, ActionType::WriteFile],
             resource_pattern: format!("{}/*", allowed_dir.display()),
             priority: 10,
         });

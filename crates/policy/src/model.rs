@@ -1,4 +1,4 @@
-use agnes_common::{ActionRequest, ActionType, Decision};
+use agnes_common::{ActionRequest, ActionType, Decision, PatternKind};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,11 +133,65 @@ impl PolicyRule {
         }
     }
 
-    /// Resolves this rule's resource pattern to its real canonical filesystem location.
-    /// Traversal components and symbolic links in directory prefixes or exact paths are expanded.
-    /// Fails closed if the pattern cannot be resolved (e.g. symlink loop, null byte, or invalid path).
+    /// Returns the pattern kind for this rule based on its action types.
+    /// Rules cannot mix filesystem path action types and literal string action types.
+    pub fn pattern_kind(&self) -> Result<PatternKind, String> {
+        if self.action_types.is_empty() {
+            if self.resource_pattern.starts_with('/') {
+                return Ok(PatternKind::FilesystemPath);
+            }
+            return Ok(PatternKind::LiteralString);
+        }
+
+        let mut has_fs = false;
+        let mut has_lit = false;
+        for action in &self.action_types {
+            match action.pattern_kind() {
+                PatternKind::FilesystemPath => has_fs = true,
+                PatternKind::LiteralString => has_lit = true,
+            }
+        }
+
+        if has_fs && has_lit {
+            return Err("Rule mixes filesystem path action types and literal string action types".to_string());
+        }
+
+        if has_fs {
+            Ok(PatternKind::FilesystemPath)
+        } else {
+            Ok(PatternKind::LiteralString)
+        }
+    }
+
+    /// Resolves this rule's resource pattern.
+    /// - For FilesystemPath: resolves directory prefixes or exact paths to real canonical locations on disk.
+    /// - For LiteralString: validates non-empty and absence of null bytes, without filesystem resolution.
+    ///
+    /// Fails closed if the pattern cannot be resolved or validated.
     pub fn resolve_pattern(&mut self) -> Result<(), std::io::Error> {
-        self.resource_pattern = resolve_resource_pattern(&self.resource_pattern)?;
+        let kind = self.pattern_kind().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
+        })?;
+
+        match kind {
+            PatternKind::FilesystemPath => {
+                self.resource_pattern = resolve_resource_pattern(&self.resource_pattern)?;
+            }
+            PatternKind::LiteralString => {
+                if self.resource_pattern.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Empty resource pattern",
+                    ));
+                }
+                if self.resource_pattern.contains('\0') {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Null byte in resource pattern",
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -187,33 +241,43 @@ impl PolicyRule {
             return false;
         }
 
-        if self.resource_pattern == "*" {
-            return true;
-        }
-
-        if let Some(prefix) = self.resource_pattern.strip_suffix("/*") {
-            let prefix = prefix.trim_end_matches('/');
-            if let Some(rest) = target.strip_prefix(prefix) {
-                if rest.is_empty() || rest.starts_with('/') {
+        let kind = self.pattern_kind().unwrap_or(PatternKind::LiteralString);
+        match kind {
+            PatternKind::LiteralString => {
+                if self.resource_pattern == "*" {
                     return true;
                 }
+                if let Some(prefix) = self.resource_pattern.strip_suffix('*') {
+                    return target.starts_with(prefix);
+                }
+                self.resource_pattern == target
             }
-            return false;
-        }
+            PatternKind::FilesystemPath => {
+                if self.resource_pattern == "*" {
+                    return true;
+                }
 
-        if let Some(prefix) = self.resource_pattern.strip_suffix('*') {
-            if target.starts_with(prefix) {
-                return true;
+                if let Some(prefix) = self.resource_pattern.strip_suffix("/*") {
+                    let prefix = prefix.trim_end_matches('/');
+                    if let Some(rest) = target.strip_prefix(prefix) {
+                        if rest.is_empty() || rest.starts_with('/') {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+
+                if let Some(prefix) = self.resource_pattern.strip_suffix('*') {
+                    if target.starts_with(prefix) {
+                        return true;
+                    }
+                    return false;
+                }
+
+                // Exact match
+                self.resource_pattern == target
             }
-            return false;
         }
-
-        // Exact match
-        if self.resource_pattern == target {
-            return true;
-        }
-
-        false
     }
 }
 

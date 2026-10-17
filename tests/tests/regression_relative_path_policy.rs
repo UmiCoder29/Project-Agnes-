@@ -83,7 +83,7 @@ impl TestSetup {
 /// (c) a subdirectory of the root
 #[test]
 fn test_relative_request_path_denied_under_different_cwds() {
-    let _lock = CWD_MUTEX.lock().unwrap();
+    let _lock = CWD_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
     let setup = TestSetup::new();
 
     // Allow everything under sandbox root
@@ -182,7 +182,7 @@ fn test_relative_request_path_denied_under_different_cwds() {
 /// 3: A relative path that worked only because the working directory equals the root is now denied.
 #[test]
 fn test_relative_path_working_only_because_cwd_equals_root_now_denied() {
-    let _lock = CWD_MUTEX.lock().unwrap();
+    let _lock = CWD_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
     let setup = TestSetup::new();
 
     // Policy allows <root>/*
@@ -236,7 +236,7 @@ fn test_relative_path_working_only_because_cwd_equals_root_now_denied() {
 /// Must be denied by POLICY, not just blocked by the post-open check.
 #[test]
 fn test_scenario_f_denied_by_policy_not_just_post_open() {
-    let _lock = CWD_MUTEX.lock().unwrap();
+    let _lock = CWD_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
     let setup = TestSetup::new();
 
     // Policy configuration for Scenario F:
@@ -310,7 +310,7 @@ fn test_scenario_f_denied_by_policy_not_just_post_open() {
 /// 3: Absolute paths still work exactly as before.
 #[test]
 fn test_absolute_paths_work_exactly_as_before() {
-    let _lock = CWD_MUTEX.lock().unwrap();
+    let _lock = CWD_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
     let setup = TestSetup::new();
 
     let policy = Policy::new("p-allow-sub", "Allow sub directory", 1).with_rule(PolicyRule {
@@ -353,16 +353,16 @@ fn test_absolute_paths_work_exactly_as_before() {
 /// must all be denied, never treated as absolute.
 #[test]
 fn test_adversarial_non_absolute_vectors_denied() {
-    let _lock = CWD_MUTEX.lock().unwrap();
+    let _lock = CWD_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
     let setup = TestSetup::new();
 
-    // Permissive wildcard policy
+    // Permissive wildcard policy for filesystem actions
     let policy = Policy::new("p-wildcard", "Wildcard Allow", 1).with_rule(PolicyRule {
         id: "r-wildcard".to_string(),
         description: "Wildcard Allow".to_string(),
         decision: Decision::Allow,
         agent_pattern: "*".to_string(),
-        action_types: vec![ActionType::ReadFile, ActionType::WriteFile, ActionType::ReadSecret],
+        action_types: vec![ActionType::ReadFile, ActionType::WriteFile],
         resource_pattern: "*".to_string(),
         priority: 10,
     });
@@ -431,7 +431,7 @@ fn test_adversarial_non_absolute_vectors_denied() {
             crafted
         );
 
-        // Test ReadSecret if it starts with path-like character
+        // Test ReadSecret: non-file actions are NOT treated as relative paths and do not match filesystem rule
         if crafted.starts_with('.') || crafted.starts_with('~') || crafted.contains('/') {
             let req_secret = ActionRequest::new(
                 "agent-001",
@@ -447,10 +447,10 @@ fn test_adversarial_non_absolute_vectors_denied() {
                 "ReadSecret with crafted path '{}' must be Denied",
                 crafted
             );
-            assert_eq!(
+            assert_ne!(
                 dec_secret.matched_policy_id,
                 "fail-closed-relative-path",
-                "ReadSecret with crafted path '{}' must match fail-closed-relative-path",
+                "ReadSecret with crafted path '{}' must NOT be treated as a relative path",
                 crafted
             );
         }

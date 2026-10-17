@@ -8,19 +8,22 @@ const MAX_SYMLINK_DEPTH: u32 = 32;
 /// Determines whether an action request targets a resource that represents a filesystem path.
 ///
 /// Filesystem actions (ReadFile, WriteFile) are always path-bearing.
-/// ReadSecret is path-bearing if its target resource is a filesystem path (e.g., /run/secrets/...,
-/// ./keys/..., or references an existing filesystem entity).
-pub fn is_path_resource(action_type: ActionType, resource: &str) -> bool {
+/// All other actions are non-path actions and use literal string matching.
+pub fn is_path_resource(action_type: ActionType) -> bool {
     match action_type {
         ActionType::ReadFile | ActionType::WriteFile => true,
-        ActionType::ReadSecret => {
-            resource.starts_with('/')
-                || resource.starts_with('.')
-                || resource.starts_with('~')
-                || resource.contains('/')
-                || resource.contains('\\')
-        }
-        _ => false,
+        ActionType::ExecuteProcess
+        | ActionType::CreateProcess
+        | ActionType::NetworkConnect
+        | ActionType::DnsLookup
+        | ActionType::HttpRequest
+        | ActionType::CallTool
+        | ActionType::CallMcpTool
+        | ActionType::ReadSecret
+        | ActionType::SendData
+        | ActionType::ModifyPolicy
+        | ActionType::RequestCredential
+        | ActionType::CommunicateWithAgent => false,
     }
 }
 
@@ -31,7 +34,7 @@ pub fn is_path_resource(action_type: ActionType, resource: &str) -> bool {
 /// Returns Ok(None) if the action does not target a filesystem path.
 /// Returns Err(Error) if path resolution fails (e.g. symlink loop, null byte, relative path, inaccessible).
 pub fn resolve_request_target(request: &ActionRequest) -> Result<Option<PathBuf>, Error> {
-    if is_path_resource(request.action_type, &request.target_resource) {
+    if is_path_resource(request.action_type) {
         if !Path::new(&request.target_resource).is_absolute() {
             return Err(Error::new(
                 ErrorKind::InvalidInput,

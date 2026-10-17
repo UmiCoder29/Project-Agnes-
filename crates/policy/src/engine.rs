@@ -177,9 +177,37 @@ impl PolicyEngine {
     }
 
     fn evaluate_internal(&self, request: &ActionRequest) -> PolicyDecisionResponse {
+        // Request consistency: Derive action type and target from payload and deny if they disagree
+        let expected_action_type = request.payload.action_type();
+        let expected_target = request.payload.target_resource();
+
+        if request.action_type != expected_action_type || request.target_resource != expected_target {
+            debug!(
+                header_action = ?request.action_type,
+                payload_action = ?expected_action_type,
+                header_target = %request.target_resource,
+                payload_target = %expected_target,
+                "ActionRequest header fields disagree with payload: fail-closed DENY"
+            );
+            return PolicyDecisionResponse {
+                decision: Decision::Deny,
+                reason: DecisionReason {
+                    policy_id: "fail-closed-request-mismatch".to_string(),
+                    rule_id: None,
+                    explanation: format!(
+                        "Request mismatch: header action_type {:?} or target '{}' disagrees with payload action_type {:?} or target '{}'",
+                        request.action_type, request.target_resource, expected_action_type, expected_target
+                    ),
+                },
+                matched_policy_id: "fail-closed-request-mismatch".to_string(),
+                evaluated_at: Utc::now(),
+                resolved_resource: None,
+            };
+        }
+
         // Fail-closed: Reject any path that is not absolute at the policy boundary
         // so no policy decision depends on the host process working directory.
-        if is_path_resource(request.action_type, &request.target_resource) {
+        if is_path_resource(request.action_type) {
             let p = Path::new(&request.target_resource);
             if !p.is_absolute() {
                 debug!(

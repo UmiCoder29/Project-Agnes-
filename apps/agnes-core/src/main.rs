@@ -172,13 +172,7 @@ async fn main() -> anyhow::Result<()> {
         log_sink: StructuredJsonLogSink,
     });
 
-    let app = Router::new()
-        .route("/health", get(health_handler))
-        .route("/v1/action", post(action_handler))
-        .route("/v1/policies", post(add_policy_handler))
-        .route("/v1/events", get(list_events_handler))
-        .route("/v1/state/:agent_id", get(agent_state_handler))
-        .with_state(state);
+    let app = create_app(state);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string()).parse::<u16>()?;
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -188,6 +182,16 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+pub fn create_app(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/v1/action", post(action_handler))
+        .route("/v1/policies", post(add_policy_handler))
+        .route("/v1/events", get(list_events_handler))
+        .route("/v1/state/:agent_id", get(agent_state_handler))
+        .with_state(state)
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -257,8 +261,22 @@ pub async fn process_action(state: &AppState, request: ActionRequest) -> Gateway
     // 2. Perform enforcement based on action type
     let enforcement_res = match &request.action_type {
         ActionType::ReadFile => state.fs_enforcer.enforce_read(&request, &decision_resp),
-        _ => {
-            // General enforcement stub for other types in v0.1
+        ActionType::WriteFile
+        | ActionType::ExecuteProcess
+        | ActionType::CreateProcess
+        | ActionType::NetworkConnect
+        | ActionType::DnsLookup
+        | ActionType::HttpRequest
+        | ActionType::CallTool
+        | ActionType::CallMcpTool
+        | ActionType::ReadSecret
+        | ActionType::SendData
+        | ActionType::ModifyPolicy
+        | ActionType::RequestCredential
+        | ActionType::CommunicateWithAgent => {
+            // General enforcement stub for other types in v0.1:
+            // Project Agnes currently only enforces ReadFile.
+            // For all other action types, policy evaluation succeeds but no actual runtime enforcement or interception is performed.
             match decision_resp.decision {
                 Decision::Deny => EnforcementResult {
                     enforcement_action: EnforcementAction::BlockRequest,
@@ -269,7 +287,7 @@ pub async fn process_action(state: &AppState, request: ActionRequest) -> Gateway
                 Decision::Allow => EnforcementResult {
                     enforcement_action: EnforcementAction::PermitExecution,
                     observed_result: ObservedResult::AccessSuccess,
-                    output: Some("Execution permitted".to_string()),
+                    output: Some("Allowed by policy; enforcement not implemented for this action type".to_string()),
                     error_message: None,
                 },
             }
@@ -810,5 +828,236 @@ mod tests {
         let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body_json["policy_id"], "p-unique-1");
         assert_eq!(body_json["reason"], "Duplicate policy ID");
+    }
+
+    #[tokio::test]
+    async fn test_gateway_unknown_action_type_returns_4xx_rejection_never_allow() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let state = Arc::new(AppState {
+            policy_engine: PolicyEngine::new(),
+            state_engine: StateEngine::new(),
+            fs_enforcer: FilesystemEnforcer::new(),
+            memory_sink: InMemoryTelemetrySink::new(),
+            log_sink: StructuredJsonLogSink,
+        });
+
+        let app = create_app(state);
+
+        // Raw JSON request with an unknown action_type TELEPORT
+        let raw_payload = serde_json::json!({
+            "correlation_id": uuid::Uuid::new_v4().to_string(),
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "agent_id": "agent-001",
+            "action_type": "TELEPORT",
+            "target_resource": "mars",
+            "payload": {
+                "type": "HTTP_REQUEST",
+                "details": {
+                    "method": "GET",
+                    "url": "https://example.com"
+                }
+            }
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/action")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&raw_payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            resp.status().is_client_error(),
+            "POST /v1/action with unknown action_type must return a 4xx client rejection, got {}",
+            resp.status()
+        );
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "Unknown action_type must NEVER return HTTP 200 Allow"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gateway_unknown_payload_type_returns_4xx_rejection_never_allow() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let state = Arc::new(AppState {
+            policy_engine: PolicyEngine::new(),
+            state_engine: StateEngine::new(),
+            fs_enforcer: FilesystemEnforcer::new(),
+            memory_sink: InMemoryTelemetrySink::new(),
+            log_sink: StructuredJsonLogSink,
+        });
+
+        let app = create_app(state);
+
+        // Raw JSON request with an unknown payload type TELEPORT
+        let raw_payload = serde_json::json!({
+            "correlation_id": uuid::Uuid::new_v4().to_string(),
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "agent_id": "agent-001",
+            "action_type": "HTTP_REQUEST",
+            "target_resource": "https://example.com",
+            "payload": {
+                "type": "TELEPORT",
+                "details": {
+                    "coordinates": "0,0"
+                }
+            }
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/action")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&raw_payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            resp.status().is_client_error(),
+            "POST /v1/action with unknown payload type must return a 4xx client rejection, got {}",
+            resp.status()
+        );
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "Unknown payload type must NEVER return HTTP 200 Allow"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gateway_request_mismatch_returns_403_fail_closed_request_mismatch() {
+        let state = Arc::new(AppState {
+            policy_engine: PolicyEngine::new(),
+            state_engine: StateEngine::new(),
+            fs_enforcer: FilesystemEnforcer::new(),
+            memory_sink: InMemoryTelemetrySink::new(),
+            log_sink: StructuredJsonLogSink,
+        });
+
+        // Even with an Allow-all policy for ReadFile
+        state
+            .policy_engine
+            .add_policy(
+                Policy::new("p-allow-all", "Allow all", 1).with_rule(PolicyRule {
+                    id: "r-allow".to_string(),
+                    description: "Allow".to_string(),
+                    decision: Decision::Allow,
+                    agent_pattern: "*".to_string(),
+                    action_types: vec![ActionType::ReadFile],
+                    resource_pattern: "*".to_string(),
+                    priority: 10,
+                }),
+            )
+            .unwrap();
+
+        // Mismatched request: action_type header is ReadFile, but payload is HttpRequest
+        let req_mismatched = ActionRequest {
+            correlation_id: uuid::Uuid::new_v4(),
+            test_id: Some("MISMATCH-GW".to_string()),
+            timestamp: chrono::Utc::now(),
+            agent_id: "agent-001".to_string(),
+            session_id: None,
+            action_type: ActionType::ReadFile,
+            target_resource: "/tmp/allowed.txt".to_string(),
+            payload: ActionPayload::HttpRequest {
+                method: "GET".to_string(),
+                url: "https://evil.com".to_string(),
+                headers: None,
+                body: None,
+            },
+        };
+
+        let response = action_handler(State(state.clone()), Json(req_mismatched)).await.into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "POST /v1/action with mismatched header and payload must return HTTP 403 Forbidden"
+        );
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body_json["decision"], "DENY");
+        assert_eq!(body_json["matched_policy_id"], "fail-closed-request-mismatch");
+        assert_eq!(body_json["enforcement_action"], "BLOCK_REQUEST");
+
+        // Target mismatch: action_type and payload type are ReadFile, but target paths differ
+        let req_target_mismatch = ActionRequest {
+            correlation_id: uuid::Uuid::new_v4(),
+            test_id: Some("MISMATCH-TARGET-GW".to_string()),
+            timestamp: chrono::Utc::now(),
+            agent_id: "agent-001".to_string(),
+            session_id: None,
+            action_type: ActionType::ReadFile,
+            target_resource: "/tmp/allowed.txt".to_string(),
+            payload: ActionPayload::ReadFile {
+                path: "/tmp/different.txt".to_string(),
+            },
+        };
+
+        let response2 = action_handler(State(state), Json(req_target_mismatch)).await.into_response();
+        assert_eq!(response2.status(), StatusCode::FORBIDDEN);
+        let body_bytes2 = axum::body::to_bytes(response2.into_body(), usize::MAX).await.unwrap();
+        let body_json2: serde_json::Value = serde_json::from_slice(&body_bytes2).unwrap();
+        assert_eq!(body_json2["decision"], "DENY");
+        assert_eq!(body_json2["matched_policy_id"], "fail-closed-request-mismatch");
+        assert_eq!(body_json2["enforcement_action"], "BLOCK_REQUEST");
+        assert_eq!(body_json2["observed_result"], "BLOCKED_BY_FIREWALL");
+    }
+
+    #[tokio::test]
+    async fn test_gateway_non_read_file_allow_stub_honesty() {
+        let state = Arc::new(AppState {
+            policy_engine: PolicyEngine::new(),
+            state_engine: StateEngine::new(),
+            fs_enforcer: FilesystemEnforcer::new(),
+            memory_sink: InMemoryTelemetrySink::new(),
+            log_sink: StructuredJsonLogSink,
+        });
+
+        // Allow HttpRequest to https://trusted.internal/*
+        state
+            .policy_engine
+            .add_policy(
+                Policy::new("p-allow-http", "Allow http", 1).with_rule(PolicyRule {
+                    id: "r-http".to_string(),
+                    description: "Allow internal HTTP".to_string(),
+                    decision: Decision::Allow,
+                    agent_pattern: "*".to_string(),
+                    action_types: vec![ActionType::HttpRequest],
+                    resource_pattern: "https://trusted.internal/*".to_string(),
+                    priority: 10,
+                }),
+            )
+            .unwrap();
+
+        let req = ActionRequest::new(
+            "agent-001",
+            ActionPayload::HttpRequest {
+                method: "GET".to_string(),
+                url: "https://trusted.internal/api/v1".to_string(),
+                headers: None,
+                body: None,
+            },
+        );
+
+        let response = action_handler(State(state), Json(req)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body_json["decision"], "ALLOW");
+        assert_eq!(body_json["enforcement_action"], "PERMIT_EXECUTION");
+        assert_eq!(body_json["observed_result"], "ACCESS_SUCCESS");
+        assert_eq!(
+            body_json["output"],
+            "Allowed by policy; enforcement not implemented for this action type"
+        );
     }
 }
