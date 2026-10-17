@@ -717,4 +717,52 @@ mod tests {
         );
         assert_eq!(state.policy_engine.evaluate(&req).decision, Decision::Allow);
     }
+
+    #[tokio::test]
+    async fn test_gateway_relative_path_returns_403_fail_closed_relative_path() {
+        let state = Arc::new(AppState {
+            policy_engine: PolicyEngine::new(),
+            state_engine: StateEngine::new(),
+            fs_enforcer: FilesystemEnforcer::new(),
+            memory_sink: InMemoryTelemetrySink::new(),
+            log_sink: StructuredJsonLogSink,
+        });
+
+        // Even with a policy that allows wildcard ReadFile
+        state
+            .policy_engine
+            .add_policy(
+                Policy::new("p-allow-all", "Allow all", 1).with_rule(PolicyRule {
+                    id: "r-allow".to_string(),
+                    description: "Allow".to_string(),
+                    decision: Decision::Allow,
+                    agent_pattern: "*".to_string(),
+                    action_types: vec![ActionType::ReadFile],
+                    resource_pattern: "*".to_string(),
+                    priority: 10,
+                }),
+            )
+            .unwrap();
+
+        let req_relative = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: "relative/path/to/file.txt".to_string(),
+            },
+        );
+
+        let response = action_handler(State(state.clone()), Json(req_relative.clone())).await.into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "POST /v1/action with a relative path must return HTTP 403 Forbidden"
+        );
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body_json["decision"], "DENY");
+        assert_eq!(body_json["matched_policy_id"], "fail-closed-relative-path");
+        assert_eq!(body_json["enforcement_action"], "BLOCK_REQUEST");
+        assert_eq!(body_json["observed_result"], "BLOCKED_BY_FIREWALL");
+    }
 }

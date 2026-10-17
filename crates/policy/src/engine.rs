@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::RwLock;
 use agnes_common::{ActionRequest, Decision, DecisionReason, PolicyDecisionResponse};
 use chrono::Utc;
@@ -5,7 +6,7 @@ use tracing::{debug, info};
 
 use crate::error::PolicyLoadError;
 use crate::model::{Policy, PolicyRule};
-use crate::path::resolve_request_target;
+use crate::path::{is_path_resource, resolve_request_target};
 
 #[derive(Default)]
 pub struct PolicyEngine {
@@ -107,6 +108,33 @@ impl PolicyEngine {
     }
 
     fn evaluate_internal(&self, request: &ActionRequest) -> PolicyDecisionResponse {
+        // Fail-closed: Reject any path that is not absolute at the policy boundary
+        // so no policy decision depends on the host process working directory.
+        if is_path_resource(request.action_type, &request.target_resource) {
+            let p = Path::new(&request.target_resource);
+            if !p.is_absolute() {
+                debug!(
+                    target = %request.target_resource,
+                    action = ?request.action_type,
+                    "Relative path rejected at policy boundary: fail-closed DENY"
+                );
+                return PolicyDecisionResponse {
+                    decision: Decision::Deny,
+                    reason: DecisionReason {
+                        policy_id: "fail-closed-relative-path".to_string(),
+                        rule_id: None,
+                        explanation: format!(
+                            "Relative path rejected: '{}' is not an absolute path",
+                            request.target_resource
+                        ),
+                    },
+                    matched_policy_id: "fail-closed-relative-path".to_string(),
+                    evaluated_at: Utc::now(),
+                    resolved_resource: None,
+                };
+            }
+        }
+
         // 1. Resolve real, final path following all symlinks for all path-bearing actions.
         let (resolved_target, resolved_resource_opt) = match resolve_request_target(request) {
             Ok(Some(path)) => {

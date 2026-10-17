@@ -566,8 +566,9 @@ impl FilesystemEnforcer {
         } else {
             // If expected_path was not directly enclosed, check if target_path or normalized target_path
             // is enclosed by a registered root that also encloses expected_path.
-            // Notice: We strictly reject any fallback that infers a root from target_path.parent()
-            // which could select an unapproved root or re-read disk state.
+            // Notice: PolicyEngine rejects relative paths at the policy boundary (fail-closed-relative-path).
+            // Relative paths are never accepted or re-rooted by the system in production; lexical checks
+            // here serve as defense in depth against traversal escapes.
             let mut fallback: Option<PathBuf> = None;
             for root in roots.iter() {
                 let lexical_target = if target_path.is_relative() {
@@ -586,7 +587,7 @@ impl FilesystemEnforcer {
             }
         };
 
-        // Lexical boundary verification: confirm target_path (whether absolute or relative)
+        // Defense-in-depth lexical boundary verification: confirm target_path
         // never resolves outside the selected sandbox root even before symlink resolution.
         let lexical_target = if target_path.is_relative() {
             Self::normalize_path(&selected_root.join(target_path))
@@ -1189,26 +1190,6 @@ mod tests {
         // 4. sub/nested/../../../forbidden/secret.txt climbs above sandbox root
         let res4 = enforcer.find_sandbox_root(&expected_file, Path::new("sub/nested/../../../forbidden/secret.txt"), "p1").unwrap();
         assert!(res4.is_none(), "Deep traversal climbing above root must be rejected");
-    }
-
-    #[test]
-    fn test_find_sandbox_root_relative_path_within_root_accepted_and_rerooted() {
-        let enforcer = FilesystemEnforcer::new();
-        let temp = TestDir::new();
-        let allowed = temp.path().join("allowed");
-        std::fs::create_dir_all(&allowed).unwrap();
-        let canonical_allowed = allowed.canonicalize().unwrap();
-        enforcer.register_sandbox_root(&canonical_allowed);
-
-        let expected_file = canonical_allowed.join("sub").join("file.txt");
-
-        // 1. sub/file.txt stays within sandbox root
-        let res1 = enforcer.find_sandbox_root(&expected_file, Path::new("sub/file.txt"), "p1").unwrap();
-        assert_eq!(res1, Some(canonical_allowed.clone()), "Relative path within sandbox root must be accepted and re-rooted");
-
-        // 2. sub/sub2/../file.txt stays within sandbox root
-        let res2 = enforcer.find_sandbox_root(&expected_file, Path::new("sub/sub2/../file.txt"), "p1").unwrap();
-        assert_eq!(res2, Some(canonical_allowed), "Relative path with inner .. staying within sandbox root must be accepted");
     }
 
     #[test]

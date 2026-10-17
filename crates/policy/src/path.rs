@@ -16,10 +16,9 @@ pub fn is_path_resource(action_type: ActionType, resource: &str) -> bool {
         ActionType::ReadSecret => {
             resource.starts_with('/')
                 || resource.starts_with('.')
+                || resource.starts_with('~')
                 || resource.contains('/')
                 || resource.contains('\\')
-                || Path::new(resource).exists()
-                || fs::symlink_metadata(resource).is_ok()
         }
         _ => false,
     }
@@ -30,9 +29,15 @@ pub fn is_path_resource(action_type: ActionType, resource: &str) -> bool {
 ///
 /// Returns Ok(Some(PathBuf)) if it is a path-bearing action and was resolved.
 /// Returns Ok(None) if the action does not target a filesystem path.
-/// Returns Err(Error) if path resolution fails (e.g. symlink loop, null byte, inaccessible).
+/// Returns Err(Error) if path resolution fails (e.g. symlink loop, null byte, relative path, inaccessible).
 pub fn resolve_request_target(request: &ActionRequest) -> Result<Option<PathBuf>, Error> {
     if is_path_resource(request.action_type, &request.target_resource) {
+        if !Path::new(&request.target_resource).is_absolute() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("Relative path not allowed: '{}'", request.target_resource),
+            ));
+        }
         resolve_real_path(&request.target_resource).map(Some)
     } else {
         Ok(None)
@@ -120,6 +125,12 @@ pub fn resolve_real_path(raw_path: &str) -> Result<PathBuf, Error> {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             "Leading or trailing whitespace in path",
+        ));
+    }
+    if !Path::new(raw_path).is_absolute() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("Relative path not allowed: '{}'", raw_path),
         ));
     }
 
