@@ -2,7 +2,7 @@
 
 ## 1. Audit Methodology & Tooling Verification
 
-An audit of test coverage across [`crates/policy/src/model.rs`](file:///home/krptex/Downloads/blackwall/crates/policy/src/model.rs) and [`crates/policy/src/engine.rs`](file:///home/krptex/Downloads/blackwall/crates/policy/src/engine.rs) was conducted.
+An audit of test coverage across [`crates/policy/src/model.rs`](../crates/policy/src/model.rs) and [`crates/policy/src/engine.rs`](../crates/policy/src/engine.rs) was conducted.
 
 The active toolchain was probed for coverage binaries:
 - `cargo llvm-cov --version`: `error: no such command: llvm-cov`

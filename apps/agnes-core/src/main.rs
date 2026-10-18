@@ -301,7 +301,7 @@ pub async fn process_action(state: &AppState, request: ActionRequest) -> Gateway
         decision_resp.reason.rule_id.clone(),
         decision_resp.decision,
         &decision_resp.reason.explanation,
-        None,
+        decision_resp.resolved_resource.clone(),
         enforcement_res.enforcement_action,
         enforcement_res.observed_result,
         serde_json::json!({
