@@ -1,3 +1,0 @@
-# Committed regression cases for adversarial filesystem fuzzing
-# Automatically loaded by Proptest before random generation
-
