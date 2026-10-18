@@ -1,0 +1,2 @@
+# Proptest regression records for adversarial filesystem fuzzing
+# Failures detected during property-based testing are persisted here for deterministic replay.
