@@ -7,7 +7,6 @@ use agnes_policy::{
 };
 use agnes_tests::SecurityTestHarness;
 use proptest::prelude::*;
-use proptest::test_runner::FileFailurePersistence;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::tempdir;
@@ -182,11 +181,8 @@ fn test_adversarial_filesystem_fuzzing() {
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: 60,
-        max_shrink_iters: 500,
-        failure_persistence: Some(Box::new(FileFailurePersistence::Direct(
-            "tests/proptest-regressions/adversarial_filesystem_fuzzing.txt",
-        ))),
+        cases: 128,
+        max_shrink_iters: 0,
         .. ProptestConfig::default()
     })]
 
@@ -211,55 +207,105 @@ proptest! {
             let _ = std::os::unix::fs::symlink(&loop_a, &loop_b);
         }
 
-        let engine = PolicyEngine::new();
-        let rule = PolicyRule {
-            id: "r-fuzz".to_string(),
-            description: "fuzz test rule".to_string(),
-            decision: Decision::Allow,
-            agent_pattern: "*".to_string(),
-            action_types: vec![ActionType::ReadFile, ActionType::WriteFile],
-            resource_pattern: "/sandbox/*".to_string(),
-            priority: 10,
-        };
-        let _ = engine.add_policy(Policy::new("p-fuzz", "Fuzz", 1).with_rule(rule.clone()));
+        let path_clone = path.clone();
+        let loop_path_clone = format!("{}/extra", loop_a.display());
+        let (tx, rx) = std::sync::mpsc::channel();
 
-        // 1. resolve_real_path must never panic or hang
-        let _ = resolve_real_path(&path);
-        let loop_path = format!("{}/extra", loop_a.display());
-        let _ = resolve_real_path(&loop_path);
+        let worker = std::thread::spawn(move || {
+            let engine = PolicyEngine::new();
+            let rule = PolicyRule {
+                id: "r-fuzz".to_string(),
+                description: "fuzz test rule".to_string(),
+                decision: Decision::Allow,
+                agent_pattern: "*".to_string(),
+                action_types: vec![ActionType::ReadFile, ActionType::WriteFile],
+                resource_pattern: "/sandbox/*".to_string(),
+                priority: 10,
+            };
+            let _ = engine.add_policy(Policy::new("p-fuzz", "Fuzz", 1).with_rule(rule.clone()));
 
-        // 2. resolve_request_target must never panic or hang (ReadFile and WriteFile)
-        let req_read = ActionRequest::new(
-            "agent-fuzz",
-            ActionPayload::ReadFile { path: path.clone() },
-        );
-        let _ = resolve_request_target(&req_read);
+            // 1. resolve_real_path must never panic or hang
+            let _ = resolve_real_path(&path_clone);
+            let _ = resolve_real_path(&loop_path_clone);
 
-        let req_write = ActionRequest::new(
-            "agent-fuzz",
-            ActionPayload::WriteFile { path: path.clone(), content: "data".to_string() },
-        );
-        let _ = resolve_request_target(&req_write);
+            // 2. resolve_request_target must never panic or hang (ReadFile and WriteFile)
+            let req_read = ActionRequest::new(
+                "agent-fuzz",
+                ActionPayload::ReadFile { path: path_clone.clone() },
+            );
+            let _ = resolve_request_target(&req_read);
 
-        // 3. PolicyEngine::evaluate must never panic or hang
-        let _ = engine.evaluate(&req_read);
-        let _ = engine.evaluate(&req_write);
+            let req_write = ActionRequest::new(
+                "agent-fuzz",
+                ActionPayload::WriteFile { path: path_clone.clone(), content: "data".to_string() },
+            );
+            let _ = resolve_request_target(&req_write);
 
-        // 4. Rule matching functions must never panic or hang
-        let _ = rule.matches_target(&req_read, &path);
-        let _ = rule.matches_resource(&path);
+            // 3. PolicyEngine::evaluate must never panic or hang
+            let _ = engine.evaluate(&req_read);
+            let _ = engine.evaluate(&req_write);
+
+            // 4. Rule matching functions must never panic or hang
+            let _ = rule.matches_target(&req_read, &path_clone);
+            let _ = rule.matches_resource(&path_clone);
+
+            let _ = tx.send(());
+        });
+
+        match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(()) => {
+                let join_res = worker.join();
+                prop_assert!(join_res.is_ok(), "Worker thread panicked on path {:?}", path);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                prop_assert!(false, "Hang bound exceeded: operation did not finish within 2 seconds for path {:?}", path);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let join_res = worker.join();
+                prop_assert!(join_res.is_ok(), "Worker thread panicked on path {:?}", path);
+            }
+        }
     }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 256,
+        max_shrink_iters: 500,
+        .. ProptestConfig::default()
+    })]
 
     // INVARIANT 2: resolve_real_path never returns Ok for a path with a null byte,
     // an empty string, leading or trailing whitespace, or a relative path.
     #[test]
     fn test_fuzz_property_2_resolve_real_path_rejects_null_empty_whitespace_relative(
         case in prop_oneof![
-            1 => prop::string::string_regex(".{0,20}\\x00.{0,20}").unwrap(),
+            // 1. Absolute paths containing a null byte (with existing directory ancestors to catch null-truncation bugs)
+            2 => prop_oneof![
+                Just("/tmp/null\0byte.txt".to_string()),
+                Just("/tmp/\0evil".to_string()),
+                Just("/dev/\0null".to_string()),
+                Just("/\0".to_string()),
+                prop::string::string_regex("/tmp/[a-zA-Z0-9_-]{1,10}\\x00[a-zA-Z0-9_-]{1,10}").unwrap(),
+                prop::string::string_regex("/[a-zA-Z0-9._/-]{0,20}\\x00[a-zA-Z0-9._/-]{0,20}").unwrap(),
+            ],
+            // 2. Empty string
             1 => Just("".to_string()),
+            // 3. Leading whitespace
             1 => prop::string::string_regex("[ \t\r\n]+/[a-zA-Z0-9/._-]*").unwrap(),
+            // 4. Trailing whitespace
             1 => prop::string::string_regex("/[a-zA-Z0-9/._-]*[ \t\r\n]+").unwrap(),
-            1 => prop::string::string_regex("[a-zA-Z0-9._][a-zA-Z0-9/._-]{0,30}").unwrap(),
+            // 5. Relative paths (including existing entries that resolve if relative check is omitted)
+            2 => prop_oneof![
+                Just(".".to_string()),
+                Just("..".to_string()),
+                Just("./tests".to_string()),
+                Just("./Cargo.toml".to_string()),
+                Just("src".to_string()),
+                Just("tests".to_string()),
+                Just("../crates".to_string()),
+                prop::string::string_regex("[a-zA-Z0-9._][a-zA-Z0-9/._-]{0,30}").unwrap(),
+            ],
         ]
     ) {
         let res = resolve_real_path(&case);
@@ -279,20 +325,20 @@ proptest! {
     fn test_fuzz_property_3_sandbox_oracle_allow_never_accesses_secret_directory(
         segments in prop::collection::vec(
             prop_oneof![
-                Just("safe.txt"),
-                Just("sub"),
-                Just("nested.txt"),
-                Just("link_to_safe"),
-                Just("link_to_secret_file"),
-                Just("link_to_secret_dir"),
-                Just("link_escape"),
-                Just("loop_a"),
-                Just("secret.txt"),
-                Just(".."),
-                Just("."),
-                Just("secret"),
-                Just("keys.txt"),
-                Just("nonexistent.txt"),
+                3 => Just("link_to_secret_file"),
+                3 => Just("link_to_secret_dir"),
+                2 => Just("link_escape"),
+                2 => Just("secret.txt"),
+                2 => Just("safe.txt"),
+                2 => Just("sub"),
+                2 => Just("nested.txt"),
+                1 => Just("link_to_safe"),
+                1 => Just("loop_a"),
+                1 => Just(".."),
+                1 => Just("."),
+                1 => Just("secret"),
+                1 => Just("keys.txt"),
+                1 => Just("nonexistent.txt"),
             ],
             1..8
         )
@@ -388,6 +434,14 @@ proptest! {
             }
         }
     }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 128,
+        max_shrink_iters: 500,
+        .. ProptestConfig::default()
+    })]
 
     // INVARIANT 4: Slash, dot, and trailing slash variants of a path always get the same decision as the clean form.
     #[test]
@@ -547,6 +601,21 @@ proptest! {
             !empty_rule.matches_target(&req, &arbitrary_target),
             "Empty pattern rule must never match any target {:?}",
             arbitrary_target
+        );
+
+        // 3. Action type mismatch: a rule for WriteFile MUST NOT match a ReadFile request
+        let write_only_rule = PolicyRule {
+            id: "r-write-only".to_string(),
+            description: "write only rule".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::WriteFile],
+            resource_pattern: "/sandbox/*".to_string(),
+            priority: 10,
+        };
+        prop_assert!(
+            !write_only_rule.matches_target(&req, &arbitrary_target),
+            "Rule with ActionType::WriteFile must never match ReadFile request"
         );
     }
 
