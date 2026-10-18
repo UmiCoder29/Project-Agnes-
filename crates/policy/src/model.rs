@@ -647,5 +647,157 @@ mod tests {
         // Target with null byte is rejected fail-closed
         assert!(!rule.matches_target(&req_matching, "/sandbox/null\0byte.txt"));
     }
+
+    #[test]
+    fn test_matches_target_action_types_read_file_does_not_match_write_file() {
+        let rule = PolicyRule {
+            id: "r-read-only".to_string(),
+            description: "read only".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "/sandbox/*".to_string(),
+            priority: 10,
+        };
+
+        let req_read = ActionRequest::new(
+            "agent-1",
+            ActionPayload::ReadFile {
+                path: "/sandbox/data.txt".to_string(),
+            },
+        );
+        let req_write = ActionRequest::new(
+            "agent-1",
+            ActionPayload::WriteFile {
+                path: "/sandbox/data.txt".to_string(),
+                content: "content".to_string(),
+            },
+        );
+
+        assert!(rule.matches_target(&req_read, "/sandbox/data.txt"));
+        assert!(!rule.matches_target(&req_write, "/sandbox/data.txt"));
+    }
+
+    #[test]
+    fn test_matches_target_action_types_multiple_matches_each_and_no_other() {
+        let rule = PolicyRule {
+            id: "r-proc-tools".to_string(),
+            description: "process and tool actions".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![
+                ActionType::ExecuteProcess,
+                ActionType::CreateProcess,
+                ActionType::CallTool,
+            ],
+            resource_pattern: "bin/*".to_string(),
+            priority: 10,
+        };
+
+        let req_exec = ActionRequest::new(
+            "agent-1",
+            ActionPayload::ExecuteProcess {
+                command: "bin/tool".to_string(),
+                args: vec![],
+            },
+        );
+        let req_create = ActionRequest::new(
+            "agent-1",
+            ActionPayload::CreateProcess {
+                executable: "bin/tool".to_string(),
+                args: vec![],
+            },
+        );
+        let req_tool = ActionRequest::new(
+            "agent-1",
+            ActionPayload::CallTool {
+                tool_name: "bin/tool".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        );
+        let req_other_secret = ActionRequest::new(
+            "agent-1",
+            ActionPayload::ReadSecret {
+                secret_id: "bin/tool".to_string(),
+            },
+        );
+        let req_other_read_file = ActionRequest::new(
+            "agent-1",
+            ActionPayload::ReadFile {
+                path: "bin/tool".to_string(),
+            },
+        );
+
+        assert!(rule.matches_target(&req_exec, "bin/tool"));
+        assert!(rule.matches_target(&req_create, "bin/tool"));
+        assert!(rule.matches_target(&req_tool, "bin/tool"));
+        assert!(!rule.matches_target(&req_other_secret, "bin/tool"));
+        assert!(!rule.matches_target(&req_other_read_file, "bin/tool"));
+    }
+
+    #[test]
+    fn test_matches_target_action_types_empty_list_matches_nothing() {
+        let rule = PolicyRule {
+            id: "r-empty-actions".to_string(),
+            description: "empty actions".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![],
+            resource_pattern: "*".to_string(),
+            priority: 10,
+        };
+
+        let req_read = ActionRequest::new(
+            "agent-1",
+            ActionPayload::ReadFile {
+                path: "/sandbox/file.txt".to_string(),
+            },
+        );
+        let req_cmd = ActionRequest::new(
+            "agent-1",
+            ActionPayload::ExecuteProcess {
+                command: "bash".to_string(),
+                args: vec![],
+            },
+        );
+
+        assert!(!rule.matches_target(&req_read, "/sandbox/file.txt"));
+        assert!(!rule.matches_target(&req_cmd, "bash"));
+    }
+
+    #[test]
+    fn test_matches_target_action_types_matching_independent_of_resource_pattern_for_non_matching_action() {
+        // Even if the resource pattern matches wildcard or matches the target string verbatim,
+        // if the action type doesn't match, matches_target must return false.
+        let rule_wild = PolicyRule {
+            id: "r-wild-resource".to_string(),
+            description: "wildcard resource pattern".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "*".to_string(),
+            priority: 10,
+        };
+        let rule_exact = PolicyRule {
+            id: "r-exact-resource".to_string(),
+            description: "exact resource pattern".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "/sandbox/target.txt".to_string(),
+            priority: 10,
+        };
+
+        let req_mismatched = ActionRequest::new(
+            "agent-1",
+            ActionPayload::WriteFile {
+                path: "/sandbox/target.txt".to_string(),
+                content: "new data".to_string(),
+            },
+        );
+
+        assert!(!rule_wild.matches_target(&req_mismatched, "/sandbox/target.txt"));
+        assert!(!rule_exact.matches_target(&req_mismatched, "/sandbox/target.txt"));
+    }
 }
 
