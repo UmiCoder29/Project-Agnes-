@@ -1020,6 +1020,352 @@ mod tests {
         );
         assert_eq!(decision.matched_policy_id, "p-init");
     }
+
+    #[test]
+    fn test_rule_precedence_priority_override_beats_specificity_and_decision() {
+        let temp = tempfile::tempdir().unwrap();
+        let target_file = temp.path().join("file.txt");
+        std::fs::write(&target_file, "DATA").unwrap();
+        let canonical_target = target_file.canonicalize().unwrap();
+        let target_str = canonical_target.to_str().unwrap().to_string();
+
+        let req = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: target_str.clone(),
+            },
+        );
+
+        // Case A: Higher priority Allow (priority 20) on wildcard beats lower priority exact Deny (priority 10)
+        {
+            let engine = PolicyEngine::new();
+            let policy = Policy::new("p-priority-allow", "Priority Allow Override", 1)
+                .with_rule(PolicyRule {
+                    id: "r-exact-deny-low-prio".to_string(),
+                    description: "Low priority exact deny".to_string(),
+                    decision: Decision::Deny,
+                    agent_pattern: "*".to_string(),
+                    action_types: vec![ActionType::ReadFile],
+                    resource_pattern: target_str.clone(),
+                    priority: 10,
+                })
+                .with_rule(PolicyRule {
+                    id: "r-wildcard-allow-high-prio".to_string(),
+                    description: "High priority wildcard allow".to_string(),
+                    decision: Decision::Allow,
+                    agent_pattern: "*".to_string(),
+                    action_types: vec![ActionType::ReadFile],
+                    resource_pattern: "*".to_string(),
+                    priority: 20,
+                });
+            assert!(engine.add_policy(policy).is_ok());
+
+            let decision = engine.evaluate(&req);
+            assert_eq!(
+                decision.decision,
+                Decision::Allow,
+                "Higher priority Allow must override lower priority exact Deny"
+            );
+            assert_eq!(decision.reason.rule_id.as_deref(), Some("r-wildcard-allow-high-prio"));
+        }
+
+        // Case B: Higher priority Deny (priority 20) on wildcard beats lower priority exact Allow (priority 10)
+        {
+            let engine = PolicyEngine::new();
+            let policy = Policy::new("p-priority-deny", "Priority Deny Override", 1)
+                .with_rule(PolicyRule {
+                    id: "r-exact-allow-low-prio".to_string(),
+                    description: "Low priority exact allow".to_string(),
+                    decision: Decision::Allow,
+                    agent_pattern: "*".to_string(),
+                    action_types: vec![ActionType::ReadFile],
+                    resource_pattern: target_str.clone(),
+                    priority: 10,
+                })
+                .with_rule(PolicyRule {
+                    id: "r-wildcard-deny-high-prio".to_string(),
+                    description: "High priority wildcard deny".to_string(),
+                    decision: Decision::Deny,
+                    agent_pattern: "*".to_string(),
+                    action_types: vec![ActionType::ReadFile],
+                    resource_pattern: "*".to_string(),
+                    priority: 20,
+                });
+            assert!(engine.add_policy(policy).is_ok());
+
+            let decision = engine.evaluate(&req);
+            assert_eq!(
+                decision.decision,
+                Decision::Deny,
+                "Higher priority Deny must override lower priority exact Allow"
+            );
+            assert_eq!(decision.reason.rule_id.as_deref(), Some("r-wildcard-deny-high-prio"));
+        }
+    }
+
+    #[test]
+    fn test_rule_precedence_specificity_component_depth_beats_shallower() {
+        let temp = tempfile::tempdir().unwrap();
+        let sub_dir = temp.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let target_file = sub_dir.join("file.txt");
+        std::fs::write(&target_file, "DATA").unwrap();
+
+        let canonical_target = target_file.canonicalize().unwrap();
+        let target_str = canonical_target.to_str().unwrap().to_string();
+
+        let deeper_dir = canonical_target.parent().unwrap(); // a/b/c
+        let shallower_dir = deeper_dir.parent().unwrap();   // a/b
+
+        let req = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: target_str.clone(),
+            },
+        );
+
+        // Subcase A: At equal priority (10), deeper component count Allow (depth 3) beats shallower Deny (depth 2)
+        {
+            let engine = PolicyEngine::new();
+            let policy = Policy::new("p-depth-allow", "Depth Allow", 1)
+                .with_rule(PolicyRule {
+                    id: "r-shallower-deny".to_string(),
+                    description: "Shallower deny".to_string(),
+                    decision: Decision::Deny,
+                    agent_pattern: "*".to_string(),
+                    action_types: vec![ActionType::ReadFile],
+                    resource_pattern: format!("{}/*", shallower_dir.display()),
+                    priority: 10,
+                })
+                .with_rule(PolicyRule {
+                    id: "r-deeper-allow".to_string(),
+                    description: "Deeper allow".to_string(),
+                    decision: Decision::Allow,
+                    agent_pattern: "*".to_string(),
+                    action_types: vec![ActionType::ReadFile],
+                    resource_pattern: format!("{}/*", deeper_dir.display()),
+                    priority: 10,
+                });
+            assert!(engine.add_policy(policy).is_ok());
+
+            let decision = engine.evaluate(&req);
+            assert_eq!(
+                decision.decision,
+                Decision::Allow,
+                "Deeper component count Allow must beat shallower Deny at equal priority"
+            );
+            assert_eq!(decision.reason.rule_id.as_deref(), Some("r-deeper-allow"));
+        }
+
+        // Subcase B: At equal priority (10), deeper component count Deny (depth 3) beats shallower Allow (depth 2)
+        {
+            let engine = PolicyEngine::new();
+            let policy = Policy::new("p-depth-deny", "Depth Deny", 1)
+                .with_rule(PolicyRule {
+                    id: "r-shallower-allow".to_string(),
+                    description: "Shallower allow".to_string(),
+                    decision: Decision::Allow,
+                    agent_pattern: "*".to_string(),
+                    action_types: vec![ActionType::ReadFile],
+                    resource_pattern: format!("{}/*", shallower_dir.display()),
+                    priority: 10,
+                })
+                .with_rule(PolicyRule {
+                    id: "r-deeper-deny".to_string(),
+                    description: "Deeper deny".to_string(),
+                    decision: Decision::Deny,
+                    agent_pattern: "*".to_string(),
+                    action_types: vec![ActionType::ReadFile],
+                    resource_pattern: format!("{}/*", deeper_dir.display()),
+                    priority: 10,
+                });
+            assert!(engine.add_policy(policy).is_ok());
+
+            let decision = engine.evaluate(&req);
+            assert_eq!(
+                decision.decision,
+                Decision::Deny,
+                "Deeper component count Deny must beat shallower Allow at equal priority"
+            );
+            assert_eq!(decision.reason.rule_id.as_deref(), Some("r-deeper-deny"));
+        }
+    }
+
+    #[test]
+    fn test_rule_precedence_specificity_prefix_len_breaks_tie() {
+        let temp = tempfile::tempdir().unwrap();
+        let target_dir = temp.path().join("base");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let target_file = target_dir.join("item_special_target.txt");
+        std::fs::write(&target_file, "DATA").unwrap();
+
+        let canonical_target = target_file.canonicalize().unwrap();
+        let target_str = canonical_target.to_str().unwrap().to_string();
+
+        let short_prefix_pattern = format!("{}/item*", target_dir.canonicalize().unwrap().display());
+        let longer_prefix_pattern = format!("{}/item_special*", target_dir.canonicalize().unwrap().display());
+
+        let req = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: target_str.clone(),
+            },
+        );
+
+        // At equal priority (10) and identical component count, longer prefix len Deny beats shorter prefix len Allow
+        let engine = PolicyEngine::new();
+        let policy = Policy::new("p-prefix-tie", "Prefix Length Tie-breaker", 1)
+            .with_rule(PolicyRule {
+                id: "r-short-prefix-allow".to_string(),
+                description: "Shorter prefix allow".to_string(),
+                decision: Decision::Allow,
+                agent_pattern: "*".to_string(),
+                action_types: vec![ActionType::ReadFile],
+                resource_pattern: short_prefix_pattern,
+                priority: 10,
+            })
+            .with_rule(PolicyRule {
+                id: "r-longer-prefix-deny".to_string(),
+                description: "Longer prefix deny".to_string(),
+                decision: Decision::Deny,
+                agent_pattern: "*".to_string(),
+                action_types: vec![ActionType::ReadFile],
+                resource_pattern: longer_prefix_pattern,
+                priority: 10,
+            });
+        assert!(engine.add_policy(policy).is_ok());
+
+        let decision = engine.evaluate(&req);
+        assert_eq!(
+            decision.decision,
+            Decision::Deny,
+            "Longer prefix length must beat shorter prefix length at equal priority and component count"
+        );
+        assert_eq!(decision.reason.rule_id.as_deref(), Some("r-longer-prefix-deny"));
+    }
+
+    #[test]
+    fn test_rule_precedence_deny_beats_allow_at_equal_priority_and_specificity() {
+        let engine = PolicyEngine::new();
+        let policy = Policy::new("p-ambiguous", "Ambiguous Conflict", 1)
+            .with_rule(PolicyRule {
+                id: "r-allow".to_string(),
+                description: "Allow wildcard".to_string(),
+                decision: Decision::Allow,
+                agent_pattern: "*".to_string(),
+                action_types: vec![ActionType::ReadFile],
+                resource_pattern: "*".to_string(),
+                priority: 10,
+            })
+            .with_rule(PolicyRule {
+                id: "r-deny".to_string(),
+                description: "Deny wildcard".to_string(),
+                decision: Decision::Deny,
+                agent_pattern: "*".to_string(),
+                action_types: vec![ActionType::ReadFile],
+                resource_pattern: "*".to_string(),
+                priority: 10,
+            });
+        assert!(engine.add_policy(policy).is_ok());
+
+        let req = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: "/tmp/any_file.txt".to_string(),
+            },
+        );
+
+        let decision = engine.evaluate(&req);
+        assert_eq!(
+            decision.decision,
+            Decision::Deny,
+            "When priority and specificity are strictly equal, engine must fail closed (Deny beats Allow)"
+        );
+        assert_eq!(decision.reason.rule_id.as_deref(), Some("r-deny"));
+    }
+
+    #[test]
+    fn test_rule_precedence_policy_id_tie_breaker() {
+        let engine = PolicyEngine::new();
+
+        // Two identical rules in separate policies: "p-alpha" vs "p-beta"
+        let policy_beta = Policy::new("p-beta", "Policy Beta", 1).with_rule(PolicyRule {
+            id: "r-same".to_string(),
+            description: "Rule".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "*".to_string(),
+            priority: 10,
+        });
+        let policy_alpha = Policy::new("p-alpha", "Policy Alpha", 1).with_rule(PolicyRule {
+            id: "r-same".to_string(),
+            description: "Rule".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "*".to_string(),
+            priority: 10,
+        });
+
+        // Add in reverse alphabetical order
+        assert!(engine.add_policy(policy_beta).is_ok());
+        assert!(engine.add_policy(policy_alpha).is_ok());
+
+        let req = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: "/tmp/any_file.txt".to_string(),
+            },
+        );
+
+        let decision = engine.evaluate(&req);
+        assert_eq!(
+            decision.matched_policy_id, "p-alpha",
+            "Policy ID ascending order must deterministically break ties when all rule properties are equal"
+        );
+    }
+
+    #[test]
+    fn test_rule_precedence_rule_id_tie_breaker() {
+        let engine = PolicyEngine::new();
+
+        // Two identical rules in same policy: "r-01" vs "r-02"
+        let policy = Policy::new("p-rules", "Policy Rules", 1)
+            .with_rule(PolicyRule {
+                id: "r-02".to_string(),
+                description: "Rule 02".to_string(),
+                decision: Decision::Allow,
+                agent_pattern: "*".to_string(),
+                action_types: vec![ActionType::ReadFile],
+                resource_pattern: "*".to_string(),
+                priority: 10,
+            })
+            .with_rule(PolicyRule {
+                id: "r-01".to_string(),
+                description: "Rule 01".to_string(),
+                decision: Decision::Allow,
+                agent_pattern: "*".to_string(),
+                action_types: vec![ActionType::ReadFile],
+                resource_pattern: "*".to_string(),
+                priority: 10,
+            });
+        assert!(engine.add_policy(policy).is_ok());
+
+        let req = ActionRequest::new(
+            "agent-001",
+            ActionPayload::ReadFile {
+                path: "/tmp/any_file.txt".to_string(),
+            },
+        );
+
+        let decision = engine.evaluate(&req);
+        assert_eq!(
+            decision.reason.rule_id.as_deref(),
+            Some("r-01"),
+            "Rule ID ascending order must deterministically break ties when all rule properties are equal"
+        );
+    }
 }
 
 

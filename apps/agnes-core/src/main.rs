@@ -1138,4 +1138,221 @@ mod tests {
         assert_eq!(event_json["rule_id"], "r-core-allow");
         assert_eq!(event_json["policy_id"], "p-core-test");
     }
+
+    #[tokio::test]
+    async fn test_process_action_explicit_deny_rule_and_recorded() {
+        let temp_dir = tempdir().unwrap();
+        let sandbox_dir = temp_dir.path().join("sandbox");
+        fs::create_dir_all(&sandbox_dir).unwrap();
+
+        let denied_file = sandbox_dir.join("forbidden.txt");
+        fs::write(&denied_file, "FORBIDDEN_CONTENT").unwrap();
+        let canonical_file = denied_file.canonicalize().unwrap();
+        let file_str = canonical_file.to_string_lossy().to_string();
+
+        let fs_enforcer = FilesystemEnforcer::new();
+        fs_enforcer.register_sandbox_root(&sandbox_dir);
+
+        let policy_engine = PolicyEngine::new();
+        policy_engine
+            .add_policy(
+                Policy::new("p-deny-policy", "Deny Policy", 1).with_rule(PolicyRule {
+                    id: "r-deny-rule".to_string(),
+                    description: "Deny forbidden file".to_string(),
+                    decision: Decision::Deny,
+                    agent_pattern: "*".to_string(),
+                    action_types: vec![ActionType::ReadFile],
+                    resource_pattern: file_str.clone(),
+                    priority: 10,
+                }),
+            )
+            .unwrap();
+
+        let memory_sink = InMemoryTelemetrySink::new();
+        let state = AppState {
+            policy_engine,
+            state_engine: StateEngine::new(),
+            fs_enforcer,
+            memory_sink,
+            log_sink: StructuredJsonLogSink,
+        };
+
+        let req = ActionRequest::new(
+            "agent-core",
+            ActionPayload::ReadFile {
+                path: file_str.clone(),
+            },
+        );
+
+        let resp = process_action(&state, req).await;
+        assert_eq!(resp.decision, Decision::Deny);
+        assert_eq!(resp.enforcement_action, EnforcementAction::BlockRequest);
+        assert_eq!(resp.observed_result, ObservedResult::BlockedByFirewall);
+        assert_eq!(resp.output, None);
+
+        let events = state.memory_sink.events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.decision, Decision::Deny);
+        assert_eq!(event.policy_id, "p-deny-policy");
+        assert_eq!(event.rule_id.as_deref(), Some("r-deny-rule"));
+        assert_eq!(event.resolved_resource.as_deref(), Some(file_str.as_str()));
+        assert_eq!(event.raw_resource, file_str);
+    }
+
+    #[tokio::test]
+    async fn test_process_action_default_deny_when_unmatched_and_recorded() {
+        let temp_dir = tempdir().unwrap();
+        let sandbox_dir = temp_dir.path().join("sandbox");
+        fs::create_dir_all(&sandbox_dir).unwrap();
+
+        let unmentioned_file = sandbox_dir.join("unmatched.txt");
+        fs::write(&unmentioned_file, "UNMATCHED_CONTENT").unwrap();
+        let canonical_file = unmentioned_file.canonicalize().unwrap();
+        let file_str = canonical_file.to_string_lossy().to_string();
+
+        let fs_enforcer = FilesystemEnforcer::new();
+        fs_enforcer.register_sandbox_root(&sandbox_dir);
+
+        let policy_engine = PolicyEngine::new();
+        let memory_sink = InMemoryTelemetrySink::new();
+        let state = AppState {
+            policy_engine,
+            state_engine: StateEngine::new(),
+            fs_enforcer,
+            memory_sink,
+            log_sink: StructuredJsonLogSink,
+        };
+
+        let req = ActionRequest::new(
+            "agent-core",
+            ActionPayload::ReadFile {
+                path: file_str.clone(),
+            },
+        );
+
+        let resp = process_action(&state, req).await;
+        assert_eq!(resp.decision, Decision::Deny);
+        assert_eq!(resp.matched_policy_id, "default-fail-closed");
+        assert_eq!(resp.enforcement_action, EnforcementAction::BlockRequest);
+        assert_eq!(resp.observed_result, ObservedResult::BlockedByFirewall);
+
+        let events = state.memory_sink.events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.decision, Decision::Deny);
+        assert_eq!(event.policy_id, "default-fail-closed");
+        assert_eq!(event.rule_id, None);
+        assert_eq!(event.resolved_resource.as_deref(), Some(file_str.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_process_action_relative_path_denied_pre_resolution_and_recorded() {
+        let fs_enforcer = FilesystemEnforcer::new();
+        let policy_engine = PolicyEngine::new();
+        let memory_sink = InMemoryTelemetrySink::new();
+        let state = AppState {
+            policy_engine,
+            state_engine: StateEngine::new(),
+            fs_enforcer,
+            memory_sink,
+            log_sink: StructuredJsonLogSink,
+        };
+
+        let req = ActionRequest::new(
+            "agent-core",
+            ActionPayload::ReadFile {
+                path: "relative/path/test.txt".to_string(),
+            },
+        );
+
+        let resp = process_action(&state, req).await;
+        assert_eq!(resp.decision, Decision::Deny);
+        assert_eq!(resp.matched_policy_id, "fail-closed-relative-path");
+
+        let events = state.memory_sink.events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.decision, Decision::Deny);
+        assert_eq!(event.policy_id, "fail-closed-relative-path");
+        assert_eq!(event.resolved_resource, None);
+        assert!(event.reason.contains("Relative path rejected"));
+    }
+
+    #[tokio::test]
+    async fn test_process_action_request_mismatch_denied_pre_resolution_and_recorded() {
+        let fs_enforcer = FilesystemEnforcer::new();
+        let policy_engine = PolicyEngine::new();
+        let memory_sink = InMemoryTelemetrySink::new();
+        let state = AppState {
+            policy_engine,
+            state_engine: StateEngine::new(),
+            fs_enforcer,
+            memory_sink,
+            log_sink: StructuredJsonLogSink,
+        };
+
+        let mut req = ActionRequest::new(
+            "agent-core",
+            ActionPayload::ReadFile {
+                path: "/sandbox/file.txt".to_string(),
+            },
+        );
+        req.target_resource = "/sandbox/tampered.txt".to_string();
+
+        let resp = process_action(&state, req).await;
+        assert_eq!(resp.decision, Decision::Deny);
+        assert_eq!(resp.matched_policy_id, "fail-closed-request-mismatch");
+
+        let events = state.memory_sink.events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.decision, Decision::Deny);
+        assert_eq!(event.policy_id, "fail-closed-request-mismatch");
+        assert_eq!(event.resolved_resource, None);
+        assert!(event.reason.contains("Request mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_process_action_resolution_failure_symlink_loop_denied_and_recorded() {
+        let temp_dir = tempdir().unwrap();
+        let loop_a = temp_dir.path().join("loop_a");
+        let loop_b = temp_dir.path().join("loop_b");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&loop_b, &loop_a).unwrap();
+            std::os::unix::fs::symlink(&loop_a, &loop_b).unwrap();
+        }
+
+        let fs_enforcer = FilesystemEnforcer::new();
+        let policy_engine = PolicyEngine::new();
+        let memory_sink = InMemoryTelemetrySink::new();
+        let state = AppState {
+            policy_engine,
+            state_engine: StateEngine::new(),
+            fs_enforcer,
+            memory_sink,
+            log_sink: StructuredJsonLogSink,
+        };
+
+        let req = ActionRequest::new(
+            "agent-core",
+            ActionPayload::ReadFile {
+                path: loop_a.to_string_lossy().to_string(),
+            },
+        );
+
+        let resp = process_action(&state, req).await;
+        assert_eq!(resp.decision, Decision::Deny);
+        assert_eq!(resp.matched_policy_id, "fail-closed-path-resolution");
+
+        let events = state.memory_sink.events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.decision, Decision::Deny);
+        assert_eq!(event.policy_id, "fail-closed-path-resolution");
+        assert_eq!(event.resolved_resource, None);
+        assert!(event.reason.contains("Path resolution failed"));
+    }
 }

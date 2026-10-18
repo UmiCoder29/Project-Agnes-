@@ -331,3 +331,321 @@ impl Policy {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agnes_common::ActionPayload;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_resolve_resource_pattern_root_and_prefix_star() {
+        // Root pattern /* and multiple leading slashes
+        assert_eq!(resolve_resource_pattern("/*").unwrap(), "/*");
+        assert_eq!(resolve_resource_pattern("//*").unwrap(), "/*");
+        assert_eq!(resolve_resource_pattern("*").unwrap(), "*");
+
+        // Empty pattern and null byte
+        assert!(resolve_resource_pattern("").is_err());
+        assert!(resolve_resource_pattern("/*\0").is_err());
+
+        // Prefix with * (not preceded by slash)
+        let temp = tempdir().unwrap();
+        let target_dir = temp.path().join("mydir");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let canonical_dir = target_dir.canonicalize().unwrap();
+
+        let pattern_prefix_star = format!("{}*", canonical_dir.display());
+        let resolved = resolve_resource_pattern(&pattern_prefix_star).unwrap();
+        assert_eq!(resolved, format!("{}*", canonical_dir.display()));
+
+        // Relative path for prefix* fails (must be absolute)
+        let bad_prefix_star = "relative/path*";
+        assert!(resolve_resource_pattern(bad_prefix_star).is_err());
+    }
+
+    #[test]
+    fn test_rule_specificity_ordering() {
+        let rule_global = PolicyRule {
+            id: "r-global".to_string(),
+            description: "all".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "*".to_string(),
+            priority: 10,
+        };
+        assert_eq!(
+            rule_global.specificity(),
+            RuleSpecificity {
+                is_exact: false,
+                component_count: 0,
+                prefix_len: 0,
+            }
+        );
+
+        let rule_depth2 = PolicyRule {
+            id: "r-depth2".to_string(),
+            description: "depth 2".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "/sandbox/dir/*".to_string(),
+            priority: 10,
+        };
+        let spec2 = rule_depth2.specificity();
+        assert!(!spec2.is_exact);
+        assert_eq!(spec2.component_count, 2);
+
+        let rule_depth3 = PolicyRule {
+            id: "r-depth3".to_string(),
+            description: "depth 3".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "/sandbox/dir/subdir/*".to_string(),
+            priority: 10,
+        };
+        let spec3 = rule_depth3.specificity();
+        assert!(!spec3.is_exact);
+        assert_eq!(spec3.component_count, 3);
+        assert!(spec3 > spec2, "Deeper component count must rank more specific");
+
+        let rule_prefix_longer = PolicyRule {
+            id: "r-longer".to_string(),
+            description: "longer".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "/sandbox/longer_name/*".to_string(),
+            priority: 10,
+        };
+        let rule_prefix_shorter = PolicyRule {
+            id: "r-shorter".to_string(),
+            description: "shorter".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "/sandbox/short/*".to_string(),
+            priority: 10,
+        };
+        assert!(
+            rule_prefix_longer.specificity() > rule_prefix_shorter.specificity(),
+            "Longer prefix len must break tie between identical component counts"
+        );
+
+        let rule_prefix_no_slash = PolicyRule {
+            id: "r-no-slash".to_string(),
+            description: "no slash".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "/sandbox/dir*".to_string(),
+            priority: 10,
+        };
+        assert_eq!(rule_prefix_no_slash.specificity().component_count, 2);
+
+        let rule_exact = PolicyRule {
+            id: "r-exact".to_string(),
+            description: "exact".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "/sandbox/dir/file.txt".to_string(),
+            priority: 10,
+        };
+        assert!(rule_exact.specificity().is_exact);
+        assert!(rule_exact.specificity() > rule_depth3.specificity());
+    }
+
+    #[test]
+    fn test_pattern_kind_derivation_from_empty_action_types_and_mixed() {
+        // Empty action types with path-starting pattern -> FilesystemPath
+        let rule_fs_empty_actions = PolicyRule {
+            id: "r1".to_string(),
+            description: "d".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![],
+            resource_pattern: "/sandbox/file.txt".to_string(),
+            priority: 10,
+        };
+        assert_eq!(
+            rule_fs_empty_actions.pattern_kind().unwrap(),
+            PatternKind::FilesystemPath
+        );
+
+        // Empty action types with non-path pattern -> LiteralString
+        let rule_lit_empty_actions = PolicyRule {
+            id: "r2".to_string(),
+            description: "d".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![],
+            resource_pattern: "https://api.example.com".to_string(),
+            priority: 10,
+        };
+        assert_eq!(
+            rule_lit_empty_actions.pattern_kind().unwrap(),
+            PatternKind::LiteralString
+        );
+
+        // Rule mixing ReadFile and HttpRequest -> Err
+        let rule_mixed = PolicyRule {
+            id: "r3".to_string(),
+            description: "mixed".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile, ActionType::HttpRequest],
+            resource_pattern: "/sandbox/*".to_string(),
+            priority: 10,
+        };
+        assert!(rule_mixed.pattern_kind().is_err());
+    }
+
+    #[test]
+    fn test_literal_string_pattern_validation() {
+        let mut rule_empty = PolicyRule {
+            id: "r-empty".to_string(),
+            description: "empty".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::HttpRequest],
+            resource_pattern: "".to_string(),
+            priority: 10,
+        };
+        assert!(rule_empty.resolve_pattern().is_err());
+
+        let mut rule_null = PolicyRule {
+            id: "r-null".to_string(),
+            description: "null".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::HttpRequest],
+            resource_pattern: "https://bad\0host".to_string(),
+            priority: 10,
+        };
+        assert!(rule_null.resolve_pattern().is_err());
+
+        let mut rule_valid = PolicyRule {
+            id: "r-valid".to_string(),
+            description: "valid".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::HttpRequest],
+            resource_pattern: "https://trusted.internal/*".to_string(),
+            priority: 10,
+        };
+        assert!(rule_valid.resolve_pattern().is_ok());
+    }
+
+    #[test]
+    fn test_matches_resource_filesystem_prefix_boundary_leak_protection() {
+        let rule_dir = PolicyRule {
+            id: "r-dir".to_string(),
+            description: "dir".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "/sandbox/data/*".to_string(),
+            priority: 10,
+        };
+
+        // Subfiles and subdirectories match
+        assert!(rule_dir.matches_resource("/sandbox/data/file.txt"));
+        assert!(rule_dir.matches_resource("/sandbox/data/sub/nested.txt"));
+        assert!(rule_dir.matches_resource("/sandbox/data"));
+
+        // Must NOT match sibling paths that share prefix string (no boundary leak)
+        assert!(!rule_dir.matches_resource("/sandbox/data_leak.txt"));
+        assert!(!rule_dir.matches_resource("/sandbox/database.db"));
+        assert!(!rule_dir.matches_resource("/sandbox/other/file.txt"));
+
+        // Prefix without slash
+        let rule_prefix_star = PolicyRule {
+            id: "r-star".to_string(),
+            description: "star".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "/sandbox/data*".to_string(),
+            priority: 10,
+        };
+        assert!(rule_prefix_star.matches_resource("/sandbox/data"));
+        assert!(rule_prefix_star.matches_resource("/sandbox/data_leak.txt"));
+        assert!(!rule_prefix_star.matches_resource("/sandbox/other.txt"));
+    }
+
+    #[test]
+    fn test_matches_resource_literal_string_variants() {
+        // Global wildcard for literal string
+        let rule_wild = PolicyRule {
+            id: "r-lit-wild".to_string(),
+            description: "d".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::HttpRequest],
+            resource_pattern: "*".to_string(),
+            priority: 10,
+        };
+        assert!(rule_wild.matches_resource("https://anywhere.com"));
+
+        // Prefix wildcard for literal string
+        let rule_prefix = PolicyRule {
+            id: "r-lit-prefix".to_string(),
+            description: "d".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::HttpRequest],
+            resource_pattern: "https://api.trusted.com/*".to_string(),
+            priority: 10,
+        };
+        assert!(rule_prefix.matches_resource("https://api.trusted.com/v1/users"));
+        assert!(!rule_prefix.matches_resource("https://api.untrusted.com/v1/users"));
+
+        // Exact match for literal string
+        let rule_exact = PolicyRule {
+            id: "r-lit-exact".to_string(),
+            description: "d".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "*".to_string(),
+            action_types: vec![ActionType::HttpRequest],
+            resource_pattern: "https://api.trusted.com/exact".to_string(),
+            priority: 10,
+        };
+        assert!(rule_exact.matches_resource("https://api.trusted.com/exact"));
+        assert!(!rule_exact.matches_resource("https://api.trusted.com/exact/extra"));
+    }
+
+    #[test]
+    fn test_matches_target_null_byte_rejection_and_agent_matching() {
+        let rule = PolicyRule {
+            id: "r-agent".to_string(),
+            description: "agent specific".to_string(),
+            decision: Decision::Allow,
+            agent_pattern: "agent-007".to_string(),
+            action_types: vec![ActionType::ReadFile],
+            resource_pattern: "/sandbox/*".to_string(),
+            priority: 10,
+        };
+
+        let req_matching = ActionRequest::new(
+            "agent-007",
+            ActionPayload::ReadFile {
+                path: "/sandbox/file.txt".to_string(),
+            },
+        );
+        assert!(rule.matches_target(&req_matching, "/sandbox/file.txt"));
+
+        let req_different_agent = ActionRequest::new(
+            "agent-999",
+            ActionPayload::ReadFile {
+                path: "/sandbox/file.txt".to_string(),
+            },
+        );
+        assert!(!rule.matches_target(&req_different_agent, "/sandbox/file.txt"));
+
+        // Target with null byte is rejected fail-closed
+        assert!(!rule.matches_target(&req_matching, "/sandbox/null\0byte.txt"));
+    }
+}
+

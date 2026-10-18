@@ -152,14 +152,15 @@ fn test_concurrent_policy_replacement_never_observes_partial_state() {
         handles.push(handle);
     }
 
-    // Reloader thread alternates between Set A and Set B
-    let reloads = 100;
-    for i in 0..reloads {
+    // Reloader thread alternates between Set A and Set B until at least 1000 evaluations occur
+    let mut i = 0;
+    while total_evaluations.load(Ordering::Relaxed) < 1000 || i < 100 {
         if i % 2 == 0 {
             engine.replace_policies(create_set_b(&env.root)).unwrap();
         } else {
             engine.replace_policies(create_set_a(&env.root)).unwrap();
         }
+        i += 1;
         thread::yield_now();
     }
 
