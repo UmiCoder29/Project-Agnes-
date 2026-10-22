@@ -148,6 +148,8 @@ impl MockAgent {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let agent_id = env::var("AGENT_ID").unwrap_or_else(|_| "mock-agent-001".to_string());
+    // Deliberate legacy fallback: support BLACKWALL_GATEWAY_URL from pre-rename configurations
+    // while prioritizing the standard AGNES_GATEWAY_URL environment variable.
     let gateway_url = env::var("AGNES_GATEWAY_URL")
         .or_else(|_| env::var("BLACKWALL_GATEWAY_URL"))
         .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());

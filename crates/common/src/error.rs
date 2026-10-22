@@ -17,5 +17,3 @@ pub enum AgnesError {
     #[error("Internal error: {0}")]
     InternalError(String),
 }
-
-pub type BlackWallError = AgnesError;

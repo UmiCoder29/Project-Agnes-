@@ -12,6 +12,16 @@ use agnes_tests::SecurityTestHarness;
 
 static CWD_MUTEX: Mutex<()> = Mutex::new(());
 
+fn acquire_cwd_lock() -> std::sync::MutexGuard<'static, ()> {
+    match CWD_MUTEX.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            CWD_MUTEX.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
 struct CwdGuard {
     original_cwd: PathBuf,
 }
@@ -83,7 +93,7 @@ impl TestSetup {
 /// (c) a subdirectory of the root
 #[test]
 fn test_relative_request_path_denied_under_different_cwds() {
-    let _lock = CWD_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+    let _lock = acquire_cwd_lock();
     let setup = TestSetup::new();
 
     // Allow everything under sandbox root
@@ -182,7 +192,7 @@ fn test_relative_request_path_denied_under_different_cwds() {
 /// 3: A relative path that worked only because the working directory equals the root is now denied.
 #[test]
 fn test_relative_path_working_only_because_cwd_equals_root_now_denied() {
-    let _lock = CWD_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+    let _lock = acquire_cwd_lock();
     let setup = TestSetup::new();
 
     // Policy allows <root>/*
@@ -236,7 +246,7 @@ fn test_relative_path_working_only_because_cwd_equals_root_now_denied() {
 /// Must be denied by POLICY, not just blocked by the post-open check.
 #[test]
 fn test_scenario_f_denied_by_policy_not_just_post_open() {
-    let _lock = CWD_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+    let _lock = acquire_cwd_lock();
     let setup = TestSetup::new();
 
     // Policy configuration for Scenario F:
@@ -310,7 +320,7 @@ fn test_scenario_f_denied_by_policy_not_just_post_open() {
 /// 3: Absolute paths still work exactly as before.
 #[test]
 fn test_absolute_paths_work_exactly_as_before() {
-    let _lock = CWD_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+    let _lock = acquire_cwd_lock();
     let setup = TestSetup::new();
 
     let policy = Policy::new("p-allow-sub", "Allow sub directory", 1).with_rule(PolicyRule {
@@ -353,7 +363,7 @@ fn test_absolute_paths_work_exactly_as_before() {
 /// must all be denied, never treated as absolute.
 #[test]
 fn test_adversarial_non_absolute_vectors_denied() {
-    let _lock = CWD_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+    let _lock = acquire_cwd_lock();
     let setup = TestSetup::new();
 
     // Permissive wildcard policy for filesystem actions

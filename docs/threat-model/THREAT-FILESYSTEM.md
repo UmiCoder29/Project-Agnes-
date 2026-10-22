@@ -45,9 +45,11 @@ Documenting the threat landscape, failure modes, and defenses for autonomous age
   4. Security system opens and reads the path.
 - **CURRENT DEFENSE (v0.1)**: None.
 - **CURRENT FAILURE**: Check and Use are decoupled in time; malicious object opened.
-- **NEW DEFENSE**: Atomic kernel resolution. The directory root descriptor is held open, and `openat2` performs resolution and file opening in a single atomic syscall with `RESOLVE_BENEATH`. Any symlink swap that tries to escape the root during resolution triggers `EXDEV` inside the kernel walk.
-- **TEST**: `REGRESSION-008`, `REGRESSION-010`, `REGRESSION-015`.
-- **RESULT**: TOCTOU race window eliminated at VFS layer.
+- **NEW DEFENSE**: Defense-in-depth:
+  1. Atomic kernel confinement via `openat2` with `RESOLVE_BENEATH`. Any symlink swap attempting to escape above the root during resolution triggers `EXDEV` inside the kernel VFS walk.
+  2. Post-open `/proc/self/fd` verification. Any intra-sandbox symlink swap replacing an approved file with another entry within the root between policy check and open is detected by comparing the opened descriptor's real path against the approved canonical path.
+- **TEST**: `REGRESSION-008`, `REGRESSION-010`, `REGRESSION-015`, `REGRESSION-018`, `REGRESSION-019`.
+- **RESULT**: TOCTOU escape above root blocked by kernel; intra-sandbox replacement races blocked by post-open descriptor verification.
 
 ---
 

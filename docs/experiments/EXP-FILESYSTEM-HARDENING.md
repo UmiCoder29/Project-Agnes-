@@ -38,7 +38,7 @@
    - *Pros*: Complete OS-level filesystem isolation.
    - *Cons*: Requires root privileges (`CAP_SYS_ADMIN`) or user namespaces (`CLONE_NEWUSER`), heavy overhead per action request, complex container nesting.
 4. **Linux `openat2(2)` with `RESOLVE_BENEATH` (Syscall 437)**:
-   - *Pros*: Kernel-enforced atomic path resolution anchored to a directory file descriptor (`dirfd`). Automatically and atomically rejects any `..` traversal that ascends above `dirfd`, and rejects any symlink that escapes the `dirfd` hierarchy with `EXDEV` (errno 18). Eliminates the TOCTOU window between verification and opening because the check and open are unified into a single atomic kernel operation.
+   - *Pros*: Kernel-enforced atomic path resolution anchored to a directory file descriptor (`dirfd`). Automatically and atomically rejects any `..` traversal that ascends above `dirfd`, and rejects any symlink that escapes the `dirfd` hierarchy with `EXDEV` (errno 18). Eliminates the TOCTOU window for escapes *above* the sandbox root because the check and open are unified into a single atomic kernel operation. (Intra-sandbox races where an approved file is swapped for another file inside the root require post-open `/proc/self/fd` verification against the approved path).
    - *Cons*: Linux 5.6+ specific (empirically confirmed present and active on our 7.0.0-38-generic kernel).
 
 ---
@@ -54,7 +54,7 @@
 ---
 
 ## 6. Selected Enforcement Mechanism: Defense-in-Depth Confinement
-We select a two-tiered defense-in-depth architecture:
+We select a three-tiered defense-in-depth architecture:
 
 1. **Tier 1: Canonical Boundary Verification & Path Normalization in Policy**:
    - Lexical and canonical path resolution relative to explicit allowed sandbox roots.
@@ -62,14 +62,17 @@ We select a two-tiered defense-in-depth architecture:
 2. **Tier 2: Kernel-Enforced Atomic Confinement (`openat2` + `RESOLVE_BENEATH`)**:
    - Filesystem enforcement opens an `O_PATH | O_DIRECTORY | O_CLOEXEC` descriptor to the canonical root.
    - Subpath resolution is performed directly via `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`.
-   - The file handle obtained is read directly via `read_to_end` from the resulting descriptor, preventing TOCTOU file replacement races.
+   - The file handle obtained is read directly via `read_to_end` from the resulting descriptor, preventing TOCTOU file replacement races that escape above the root.
    - If `openat2` returns `EXDEV`, the operation is blocked with `KERNEL_RESOLVE_BENEATH_BLOCK` and `ObservedResult::BlockedByFirewall`.
+3. **Tier 3: Post-Open Inode/Path Identity Verification (`/proc/self/fd`)**:
+   - After `openat2` returns an open file descriptor, the real path of the open descriptor is read back via `/proc/self/fd/{fd}` and verified against the canonical path approved by the policy engine.
+   - This closes intra-sandbox TOCTOU races where an attacker swaps an approved file for a denied file within the sandbox root after policy approval but before open.
 
 ---
 
 ## 7. Why Selected
-- **Atomic Kernel Confinement**: The kernel guarantees during the VFS walk that resolution never steps out of `dirfd`.
-- **TOCTOU Immunity**: No separate `stat` -> `sleep` -> `read`. The descriptor is opened atomically under kernel flags.
+- **Atomic Kernel Confinement**: The kernel guarantees during the VFS walk that resolution never steps out of `dirfd` (escapes above the sandbox root).
+- **TOCTOU Defense-in-Depth**: `openat2` eliminates escape races above the root, and post-open `/proc/self/fd` verification eliminates intra-sandbox swap races between the policy check and the open.
 - **Portability & Safety**: Clean fallback with safe canonical verification if running on platforms without `openat2`, but native `openat2` on Linux.
 
 ---

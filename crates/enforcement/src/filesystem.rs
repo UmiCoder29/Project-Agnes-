@@ -6,7 +6,7 @@ use std::fs;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{FromRawFd, RawFd};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use tracing::{info, warn};
 
@@ -402,25 +402,45 @@ impl FilesystemEnforcer {
         }
     }
 
-    pub fn register_sandbox_root(&self, root: impl AsRef<Path>) {
-        if let Ok(canonical) = root.as_ref().canonicalize() {
-            let mut guard = match self.sandbox_roots.write() {
-                Ok(g) => g,
-                Err(poisoned) => {
-                    tracing::warn!("Recovering poisoned sandbox_roots write lock");
-                    poisoned.into_inner()
+    pub fn register_sandbox_root(&self, root: impl AsRef<Path>) -> bool {
+        let root_ref = root.as_ref();
+        match root_ref.canonicalize() {
+            Ok(canonical) => {
+                let mut guard = match self.sandbox_roots.write() {
+                    Ok(g) => g,
+                    Err(poisoned) => {
+                        tracing::warn!("Recovering poisoned sandbox_roots write lock");
+                        poisoned.into_inner()
+                    }
+                };
+                self.sandbox_roots.clear_poison();
+                if !guard.contains(&canonical) {
+                    info!(root = %canonical.display(), "Registered sandbox root for kernel confinement");
+                    guard.push(canonical);
                 }
-            };
-            self.sandbox_roots.clear_poison();
-            if !guard.contains(&canonical) {
-                info!(root = %canonical.display(), "Registered sandbox root for kernel confinement");
-                guard.push(canonical);
+                true
+            }
+            Err(err) => {
+                tracing::warn!(
+                    root = %root_ref.display(),
+                    error = %err,
+                    "Failed to register sandbox root: canonicalization failed (fail-closed)"
+                );
+                false
             }
         }
     }
 
     /// Enforces file read action according to the deterministic policy decision
     /// and Linux kernel-enforced confinement (openat2 with RESOLVE_BENEATH).
+    ///
+    /// # Note on Guarantees and Limits (Updated 2026-10)
+    /// `openat2` with `RESOLVE_BENEATH` eliminates TOCTOU escapes *above* the sandbox root directory.
+    /// Traversal or symlinks that escape above `dirfd` are rejected atomically by the kernel with `EXDEV`.
+    /// However, races *inside* the sandbox (such as replacing an approved file with a symlink to another
+    /// denied file within the same sandbox root between policy check and open) are closed by the post-open
+    /// comparison of `/proc/self/fd/{fd}` against the approved canonical path, NOT by `openat2`.
+    /// See `README.md` and `docs/experiments/EXP-FILESYSTEM-HARDENING.md` for current guarantees and limits.
     ///
     /// # TOCTOU Confinement Guarantee & Limits
     ///
@@ -572,9 +592,9 @@ impl FilesystemEnforcer {
             let mut fallback: Option<PathBuf> = None;
             for root in roots.iter() {
                 let lexical_target = if target_path.is_relative() {
-                    Self::normalize_path(&root.join(target_path))
+                    agnes_policy::path::normalize_lexical_pathbuf(&root.join(target_path))
                 } else {
-                    Self::normalize_path(target_path)
+                    agnes_policy::path::normalize_lexical_pathbuf(target_path)
                 };
                 if lexical_target.starts_with(root) && expected_path.starts_with(root) {
                     fallback = Some(root.clone());
@@ -590,9 +610,9 @@ impl FilesystemEnforcer {
         // Defense-in-depth lexical boundary verification: confirm target_path
         // never resolves outside the selected sandbox root even before symlink resolution.
         let lexical_target = if target_path.is_relative() {
-            Self::normalize_path(&selected_root.join(target_path))
+            agnes_policy::path::normalize_lexical_pathbuf(&selected_root.join(target_path))
         } else {
-            Self::normalize_path(target_path)
+            agnes_policy::path::normalize_lexical_pathbuf(target_path)
         };
 
         if !lexical_target.starts_with(&selected_root) {
@@ -606,20 +626,6 @@ impl FilesystemEnforcer {
         }
 
         Ok(Some(selected_root))
-    }
-
-    pub fn normalize_path(path: &Path) -> PathBuf {
-        let mut out = PathBuf::new();
-        for comp in path.components() {
-            match comp {
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    out.pop();
-                }
-                c => out.push(c.as_os_str()),
-            }
-        }
-        out
     }
 
     /// Uses Linux openat2 with RESOLVE_BENEATH to atomically confine open to root_dir,
@@ -1206,6 +1212,76 @@ mod tests {
 
         let res = enforcer.find_sandbox_root(&expected_file, &climbing_abs, "p1").unwrap();
         assert!(res.is_none(), "Absolute path with .. climbing above root must be rejected before symlink resolution");
+    }
+
+    #[test]
+    fn test_register_sandbox_root_failed_canonicalize_returns_false_and_registers_nothing() {
+        let enforcer = FilesystemEnforcer::new();
+        let nonexistent = Path::new("/path/that/definitely/does/not/exist/987654321");
+        let success = enforcer.register_sandbox_root(nonexistent);
+        assert!(!success, "register_sandbox_root must return false when canonicalization fails");
+
+        let guard = enforcer.sandbox_roots.read().unwrap();
+        assert!(guard.is_empty(), "No root must be registered on failed canonicalize");
+    }
+
+    #[test]
+    fn test_normalize_path_equivalence_to_policy_normalizer() {
+        fn legacy_normalize_path(path: &Path) -> PathBuf {
+            use std::path::Component;
+            let mut out = PathBuf::new();
+            for comp in path.components() {
+                match comp {
+                    Component::CurDir => {}
+                    Component::ParentDir => {
+                        out.pop();
+                    }
+                    c => out.push(c.as_os_str()),
+                }
+            }
+            out
+        }
+
+        let test_cases = [
+            // dot segments
+            "/a/./b/./c",
+            "a/./b/./c",
+            "./a/b/c",
+            "/./././",
+            "./.",
+            // repeated slashes
+            "/a//b///c",
+            "//a//b//",
+            "///",
+            "a///b////c",
+            // trailing slash
+            "/a/b/c/",
+            "a/b/c/",
+            "/",
+            "///",
+            // parent segments above the root
+            "/../../a/b",
+            "../../a/b",
+            "/a/../../b",
+            "/a/b/../../../../",
+            "/a/b/c/../../..",
+            // empty components / roots
+            "",
+            "a//b",
+            "a/b/.",
+            "a/b/..",
+        ];
+
+        for input in test_cases {
+            let path = Path::new(input);
+            let legacy_out = legacy_normalize_path(path);
+            let policy_out = agnes_policy::path::normalize_lexical_pathbuf(path);
+            assert_eq!(
+                legacy_out, policy_out,
+                "Normalizers disagreed on input: {:?}",
+                input
+            );
+        }
     }
 }
 

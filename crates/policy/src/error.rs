@@ -14,8 +14,6 @@ pub enum PolicyLoadError {
     DuplicatePolicyId {
         policy_id: String,
     },
-    #[error("Policy storage lock poisoned")]
-    LockPoisoned,
 }
 
 impl PolicyLoadError {
