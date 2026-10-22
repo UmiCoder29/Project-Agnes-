@@ -30,6 +30,7 @@ services:
       PORT: 8080
       DATABASE_URL: "postgres://agnes:agnes_dev_password@postgres:5432/agnes_db"
       RUST_LOG: "info,agnes=debug"
+      AGNES_SANDBOX_ROOTS: "/sandbox"
     depends_on:
       postgres:
         condition: service_healthy
