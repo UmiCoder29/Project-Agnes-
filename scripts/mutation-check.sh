@@ -4,36 +4,52 @@ set -euo pipefail
 # Project Agnes - Automated Mutation Verification Gate
 # Creates a temporary git worktree copy, validates each baseline test on unmutated code,
 # verifies project compiles after mutation (rejecting compile failures as BROKEN MUTATION),
-# runs the regression test, verifies test failure ("<test_name> ... FAILED" and "1 failed"),
-# and runs a self-test proving the harness correctly reports NOT caught on mismatched tests.
+# runs the regression test with a per-test timeout, verifies failure ("<test_name> ... FAILED" and "1 failed"),
+# reports timeouts as TIMED OUT, and runs a self-test proving the harness correctly reports NOT caught.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKTREE_DIR="$(mktemp -d /tmp/agnes_mutation_gate.XXXXXX)"
 rmdir "${WORKTREE_DIR}"
 LOG_DIR="$(mktemp -d /tmp/agnes_mutation_logs.XXXXXX)"
-TMP_TARGET_DIR="$(mktemp -d /tmp/agnes_mutation_target.XXXXXX)"
+
+TEST_TIMEOUT="${TEST_TIMEOUT:-180}"
+FAILURE_OCCURRED=true
 
 cleanup() {
     echo "Cleaning up worktree at ${WORKTREE_DIR}..."
     git -C "${REPO_ROOT}" worktree remove --force "${WORKTREE_DIR}" 2>/dev/null || true
-    rm -rf "${WORKTREE_DIR}" "${LOG_DIR}" "${TMP_TARGET_DIR}"
+    rm -rf "${WORKTREE_DIR}"
+
+    if [ "${FAILURE_OCCURRED}" = true ]; then
+        echo "Preserving mutation run logs at ${REPO_ROOT}/mutation-logs/..."
+        rm -rf "${REPO_ROOT}/mutation-logs"
+        mkdir -p "${REPO_ROOT}/mutation-logs"
+        cp -r "${LOG_DIR}"/* "${REPO_ROOT}/mutation-logs/" 2>/dev/null || true
+        echo "Preserved logs directory: ${REPO_ROOT}/mutation-logs/"
+    else
+        echo "All mutations verified successfully. Cleaning up temporary logs..."
+        rm -rf "${REPO_ROOT}/mutation-logs"
+    fi
+    rm -rf "${LOG_DIR}"
 }
 trap cleanup EXIT INT TERM
 
 echo "Creating temporary git worktree at ${WORKTREE_DIR}..."
 git -C "${REPO_ROOT}" worktree add "${WORKTREE_DIR}" HEAD --detach
 
-# Export CARGO_TARGET_DIR to temporary target directory unless overridden
+# Export CARGO_TARGET_DIR to repo target directory unless overridden
 if [ -z "${CARGO_TARGET_DIR:-}" ]; then
-    export CARGO_TARGET_DIR="${TMP_TARGET_DIR}"
+    export CARGO_TARGET_DIR="${REPO_ROOT}/target"
 fi
 echo "Using CARGO_TARGET_DIR: ${CARGO_TARGET_DIR}"
 echo "Using LOG_DIR: ${LOG_DIR}"
+echo "Using per-test timeout: ${TEST_TIMEOUT}s"
 
 TOTAL_MUTATIONS=0
 CAUGHT_MUTATIONS=0
 NOT_CAUGHT_MUTATIONS=0
 BROKEN_MUTATIONS=0
+TIMED_OUT_MUTATIONS=0
 BASELINE_FAILURES=0
 
 run_mutation() {
@@ -67,9 +83,16 @@ run_mutation() {
     local baseline_log="${LOG_DIR}/mutation_${num}_baseline.log"
     echo "  [1/3] Running baseline test: ${test_name} on unmutated code..."
     set +e
-    (cd "${WORKTREE_DIR}" && cargo test "${cargo_args[@]}" -- "${test_name}" >"${baseline_log}" 2>&1)
+    (cd "${WORKTREE_DIR}" && timeout "${TEST_TIMEOUT}s" cargo test "${cargo_args[@]}" -- "${test_name}" >"${baseline_log}" 2>&1)
     local baseline_status=$?
     set -e
+
+    if [ ${baseline_status} -eq 124 ]; then
+        echo "  RESULT: BASELINE FAILURE (TIMED OUT)! Test ${test_name} timed out after ${TEST_TIMEOUT}s on unmutated code."
+        echo "  Log: ${baseline_log}"
+        BASELINE_FAILURES=$((BASELINE_FAILURES + 1))
+        return
+    fi
 
     if [ ${baseline_status} -ne 0 ] || ! grep -q "${test_name} \.\.\. ok" "${baseline_log}" || ! grep -q "1 passed; 0 failed" "${baseline_log}"; then
         echo "  RESULT: BASELINE FAILURE! Test ${test_name} failed or did not run exactly 1 passing test."
@@ -97,13 +120,20 @@ run_mutation() {
         return
     fi
 
-    # 3. Run the named test and verify failure
+    # 3. Run the named test with timeout and verify failure
     local test_log="${LOG_DIR}/mutation_${num}_test.log"
-    echo "  [3/3] Running regression test against mutated code..."
+    echo "  [3/3] Running regression test against mutated code (timeout: ${TEST_TIMEOUT}s)..."
     set +e
-    (cd "${WORKTREE_DIR}" && cargo test "${cargo_args[@]}" -- "${test_name}" >"${test_log}" 2>&1)
+    (cd "${WORKTREE_DIR}" && timeout "${TEST_TIMEOUT}s" cargo test "${cargo_args[@]}" -- "${test_name}" >"${test_log}" 2>&1)
     local test_status=$?
     set -e
+
+    if [ ${test_status} -eq 124 ]; then
+        echo "  RESULT: TIMED OUT! Test ${test_name} timed out after ${TEST_TIMEOUT}s against mutated code."
+        echo "  Log: ${test_log}"
+        TIMED_OUT_MUTATIONS=$((TIMED_OUT_MUTATIONS + 1))
+        return
+    fi
 
     # Requirement: count as caught ONLY when output contains exact test name with FAILED and "1 failed"
     if grep -E -q "${test_name} \.\.\. FAILED" "${test_log}" && grep -q "1 failed" "${test_log}"; then
@@ -344,11 +374,13 @@ old = """        // 2. Validate and resolve every rule pattern across every poli
         // 3. Atomically swap the entire policy set under ONE write lock acquisition
         let mut guard = match self.policies.write() {"""
 new = """        // Non-atomic mutation: clear state before validation
-        let mut guard = match self.policies.write() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.clear();
+        {
+            let mut cleared = match self.policies.write() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            cleared.clear();
+        }
         for policy in &mut new_policies {
             policy.validate_and_resolve_patterns()?;
         }
@@ -463,7 +495,7 @@ open(full_path, "w").write(c.replace(old, new, 1))
 DELIBERATELY_WRONG_TEST="test_nonexistent_wrong_test_name_proves_harness_can_fail"
 self_test_log="${LOG_DIR}/self_test_deliberate_failure.log"
 set +e
-(cd "${WORKTREE_DIR}" && cargo test --package "agnes-core" --bin "agnes-core" -- "${DELIBERATELY_WRONG_TEST}" >"${self_test_log}" 2>&1)
+(cd "${WORKTREE_DIR}" && timeout "${TEST_TIMEOUT}s" cargo test --package "agnes-core" --bin "agnes-core" -- "${DELIBERATELY_WRONG_TEST}" >"${self_test_log}" 2>&1)
 set -e
 
 if grep -E -q "${DELIBERATELY_WRONG_TEST} \.\.\. FAILED" "${self_test_log}" && grep -q "1 failed" "${self_test_log}"; then
@@ -480,6 +512,7 @@ echo "Mutation Verification Summary:"
 echo "  Caught:            ${CAUGHT_MUTATIONS} / ${TOTAL_MUTATIONS}"
 echo "  Not Caught:        ${NOT_CAUGHT_MUTATIONS}"
 echo "  Broken Mutations:  ${BROKEN_MUTATIONS}"
+echo "  Timed Out:         ${TIMED_OUT_MUTATIONS}"
 echo "  Baseline Failures: ${BASELINE_FAILURES}"
 echo "  Self-Test:         $(if [ "${SELF_TEST_PASSED}" = true ]; then echo "PASSED"; else echo "FAILED"; fi)"
 echo "======================================================================"
@@ -487,11 +520,14 @@ echo "======================================================================"
 if [ "${CAUGHT_MUTATIONS}" -eq "${TOTAL_MUTATIONS}" ] && \
    [ "${NOT_CAUGHT_MUTATIONS}" -eq 0 ] && \
    [ "${BROKEN_MUTATIONS}" -eq 0 ] && \
+   [ "${TIMED_OUT_MUTATIONS}" -eq 0 ] && \
    [ "${BASELINE_FAILURES}" -eq 0 ] && \
    [ "${SELF_TEST_PASSED}" = true ]; then
     echo "ALL 14 MUTATIONS CAUGHT. SELF-TEST PASSED. Milestone 1 security tests verified."
+    FAILURE_OCCURRED=false
     exit 0
 else
     echo "ERROR: Mutation gate verification failed!"
+    FAILURE_OCCURRED=true
     exit 1
 fi
